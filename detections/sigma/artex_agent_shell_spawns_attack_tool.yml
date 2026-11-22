@@ -2,10 +2,10 @@ title: ARTEX Agent Shell Spawns an Attack Tool Through the Spoor Shim
 id: 4bd2fb03-9bfe-41f7-931c-c393a463a274
 status: experimental
 description: >
-  Adapted for Spoor's Agentmetry event fields. Detects an allowed brokered
-  attack-tool invocation when the Linux parent command line identifies ARTEX
-  or a shell. Parent metadata is a bounded, best-effort /proc snapshot; it is
-  a detection lead, not independent proof of process creation or intent.
+  Detects a Spoor completion report for a brokered attack tool when its Linux
+  parent command identifies ARTEX or a shell. The phase field works on Spoor's
+  outgoing payload and on stored Agentmetry events. Parent metadata is a
+  bounded, best-effort /proc snapshot for triage.
 author: Agentic lab (adapted from ThreatDefence/agentic-attack-detections)
 date: 2026/11/22
 references:
@@ -16,7 +16,7 @@ logsource:
   service: spoor
 detection:
   selection_event:
-    event_type: tool_called
+    tool.arguments.phase: completion
   selection_attack_tool:
     tool.arguments.command|re: '(?i)(^|[\s;&|])(nmap|naabu|masscan|nuclei|katana|dalfox|ffuf|gobuster|feroxbuster|sqlmap|nikto|wpscan|hydra|netexec|nxc|crackmapexec|chisel|evil-winrm|msfconsole)(\s|$)'
   selection_agent_parent:

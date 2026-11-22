@@ -1,5 +1,6 @@
-{"name":"agent parent with a scanning-tool event","expected":true,"event":{"event_type":"tool_called","tool":{"arguments":{"command":"nmap","parent_command_line":"/app/artex --worker"}}}}
-{"name":"shell parent with a scanning-tool event","expected":true,"event":{"event_type":"tool_called","tool":{"arguments":{"command":"nmap","parent_command_line":"/bin/sh -c nmap"}}}}
-{"name":"benign tool event","expected":false,"event":{"event_type":"tool_called","tool":{"arguments":{"command":"echo hello","parent_command_line":"/app/artex --worker"}}}}
-{"name":"unrelated parent","expected":false,"event":{"event_type":"tool_called","tool":{"arguments":{"command":"nmap","parent_command_line":"/usr/sbin/cron -f"}}}}
-{"name":"policy denied the tool","expected":false,"event":{"event_type":"tool_denied","tool":{"arguments":{"command":"nmap","parent_command_line":"/app/artex --worker"}}}}
+{"name":"agent parent with a scanning-tool completion","expected":true,"event":{"event_type":"tool_called","tool":{"arguments":{"phase":"completion","command":"nmap","parent_command_line":"/app/artex --worker"}}}}
+{"name":"Agentmetry stored a scanning-tool failure from a shell parent","expected":true,"event":{"action":{"type":"tool_called","outcome":"error"},"tool":{"arguments":{"phase":"completion","command":"nmap","parent_command_line":"/bin/sh -c nmap"}}}}
+{"name":"benign tool completion","expected":false,"event":{"event_type":"tool_called","tool":{"arguments":{"phase":"completion","command":"echo hello","parent_command_line":"/app/artex --worker"}}}}
+{"name":"unrelated parent","expected":false,"event":{"event_type":"tool_called","tool":{"arguments":{"phase":"completion","command":"nmap","parent_command_line":"/usr/sbin/cron -f"}}}}
+{"name":"policy denied the tool","expected":false,"event":{"event_type":"tool_denied","tool":{"arguments":{"phase":"authorization","command":"nmap","parent_command_line":"/app/artex --worker"}}}}
+{"name":"authorization alone does not indicate completion","expected":false,"event":{"event_type":"tool_authorized","tool":{"arguments":{"phase":"authorization","command":"nmap","parent_command_line":"/app/artex --worker"}}}}

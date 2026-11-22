@@ -22,8 +22,11 @@ fn with_framework(ev: &BrokerEvent, reason: &str) -> String {
     }
 }
 
-fn broker_arguments(ev: &BrokerEvent, command: &str) -> Value {
-    let mut arguments = serde_json::json!({ "command": command });
+fn broker_arguments(ev: &BrokerEvent, command: &str, phase: &str) -> Value {
+    let mut arguments = serde_json::json!({ "command": command, "phase": phase });
+    if let Some(call_id) = ev.call_id.as_deref().filter(|id| !id.is_empty()) {
+        arguments["call_id"] = serde_json::json!(call_id);
+    }
     if let Some(parent) = ev.parent_command_line.as_deref() {
         arguments["parent_command_line"] = serde_json::json!(parent);
     }
@@ -45,7 +48,7 @@ pub fn map_event(ev: &BrokerEvent) -> Vec<IngestPayload> {
             let tool = ToolBlock {
                 qualified: "Shell.run".to_string(),
                 server: "artex".to_string(),
-                arguments: broker_arguments(ev, &command),
+                arguments: broker_arguments(ev, &command, "authorization"),
             };
             let decision = ev.decision.clone().unwrap_or_default();
             let framework_data = if ev.framework_match.is_empty() {
@@ -77,8 +80,8 @@ pub fn map_event(ev: &BrokerEvent) -> Vec<IngestPayload> {
                         correlation_id: session.clone(),
                         session_id: session,
                         tool,
-                        event_type: "tool_called".to_string(),
-                        outcome: "success".to_string(),
+                        event_type: "tool_authorized".to_string(),
+                        outcome: "pending".to_string(),
                         reason,
                         task_id: None,
                         data: framework_data.clone(),
@@ -126,27 +129,34 @@ pub fn map_event(ev: &BrokerEvent) -> Vec<IngestPayload> {
             }
         }
         "report" => {
-            let exit = ev.exit_code.unwrap_or(0);
-            if exit == 0 {
+            let Some(exit) = ev.exit_code else {
                 return vec![];
-            }
+            };
             let session = ev
                 .session
                 .clone()
                 .unwrap_or_else(|| "lab-session".to_string());
+            let mut arguments =
+                broker_arguments(ev, ev.command.as_deref().unwrap_or(&ev.tool), "completion");
+            arguments["exit_code"] = serde_json::json!(exit);
             let tool = ToolBlock {
                 qualified: "Shell.run".to_string(),
                 server: "artex".to_string(),
-                arguments: broker_arguments(ev, &ev.tool),
+                arguments,
+            };
+            let (event_type, outcome) = if exit == 0 {
+                ("tool_called", "success")
+            } else {
+                ("tool_failed", "error")
             };
             vec![IngestPayload {
                 source_app: "artex".to_string(),
                 correlation_id: session.clone(),
                 session_id: session,
                 tool,
-                event_type: "tool_failed".to_string(),
-                outcome: "error".to_string(),
-                reason: format!("exit {}", exit),
+                event_type: event_type.to_string(),
+                outcome: outcome.to_string(),
+                reason: with_framework(ev, &format!("exit {}", exit)),
                 task_id: None,
                 data: None,
             }]
@@ -331,6 +341,7 @@ mod llm_tests {
     fn parent_command_line_maps_to_canonical_tool_arguments() {
         let decide: BrokerEvent = serde_json::from_value(serde_json::json!({
             "type": "decide",
+            "call_id": "call-1",
             "tool": "nmap",
             "command": "nmap -sV juice-shop",
             "parent_command_line": "/app/artex --worker",
@@ -339,6 +350,10 @@ mod llm_tests {
         }))
         .unwrap();
         let payloads = map_event(&decide);
+        assert_eq!(payloads[0].event_type, "tool_authorized");
+        assert_eq!(payloads[0].outcome, "pending");
+        assert_eq!(payloads[0].tool.arguments["call_id"], "call-1");
+        assert_eq!(payloads[0].tool.arguments["phase"], "authorization");
         assert_eq!(payloads[0].tool.arguments["command"], "nmap -sV juice-shop");
         assert_eq!(
             payloads[0].tool.arguments["parent_command_line"],
@@ -347,6 +362,7 @@ mod llm_tests {
 
         let report: BrokerEvent = serde_json::from_value(serde_json::json!({
             "type": "report",
+            "call_id": "call-1",
             "tool": "nmap",
             "exit_code": 1,
             "parent_command_line": "/app/artex --worker",
@@ -355,10 +371,33 @@ mod llm_tests {
         .unwrap();
         let payloads = map_event(&report);
         assert_eq!(payloads[0].event_type, "tool_failed");
+        assert_eq!(payloads[0].tool.arguments["call_id"], "call-1");
+        assert_eq!(payloads[0].tool.arguments["phase"], "completion");
+        assert_eq!(payloads[0].tool.arguments["exit_code"], 1);
         assert_eq!(
             payloads[0].tool.arguments["parent_command_line"],
             "/app/artex --worker"
         );
+    }
+
+    #[test]
+    fn reports_successful_exit_and_ignores_report_without_exit_code() {
+        let mut report: BrokerEvent = serde_json::from_value(serde_json::json!({
+            "type": "report",
+            "tool": "echo",
+            "command": "echo hello",
+            "exit_code": 0
+        }))
+        .unwrap();
+        let payloads = map_event(&report);
+        let payload = &payloads[0];
+        assert_eq!(payload.event_type, "tool_called");
+        assert_eq!(payload.outcome, "success");
+        assert_eq!(payload.tool.arguments["command"], "echo hello");
+        assert_eq!(payload.tool.arguments["exit_code"], 0);
+        assert!(payload.tool.arguments.get("call_id").is_none());
+        report.exit_code = None;
+        assert!(map_event(&report).is_empty());
     }
 }
 

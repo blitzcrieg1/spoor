@@ -35,14 +35,16 @@ flowchart TD
 ```
 
 The broker gives each decision a call ID. An allowed tool's report uses that ID,
-and Spoor carries the original session and parent command into the report. On
-Linux the shim samples the parent command and redacts common credential patterns.
+and Spoor keeps the original session, command, and parent metadata. On Linux the
+shim samples the parent command and redacts common credential patterns.
 
 ## Try a synthetic trace
 
 Use a stable Rust toolchain with Cargo and Python 3.10 or newer. The same
-command works in PowerShell and Bash. The example reads two synthetic records
-and prints the local preview without contacting ARTEX or Agentmetry.
+command works in PowerShell and Bash. It starts the real shim, broker, and
+watcher with a loopback mock collector. Two harmless tool calls share one
+session, with exit codes 0 and 7. The demo checks each decision against its
+own completion and checks that strict audit refuses a call it cannot record.
 
 ```sh
 python scripts/run_synthetic_trace.py
@@ -52,24 +54,30 @@ python scripts/run_synthetic_trace.py
 
 ```mermaid
 sequenceDiagram
-    participant Trail as Synthetic broker trail
+    participant Trail as Spoor broker trail
     participant Watcher as Spoor watcher
-    participant Preview as Local audit preview
-    Trail->>Watcher: Policy allows echo
-    Watcher->>Preview: tool_called in demo-session
-    Trail->>Watcher: Tool reports exit code 1
-    Watcher->>Preview: tool_failed in demo-session
-    Note over Watcher,Preview: Both events keep the same redacted parent command
+    participant Preview as Local mock collector
+    Trail->>Watcher: Both calls authorized
+    Watcher->>Preview: Authorization for call A and call B
+    Trail->>Watcher: Call A exits 0 and call B exits 7
+    Watcher->>Preview: Completion for each call with its own exit code
+    Note over Watcher,Preview: One session, two call IDs
 ```
 
-`tool_called` tells you the broker allowed the request. `tool_failed` tells you
-the command exited with an error. Both events have `demo-session` and carry
-`synthetic-parent --token=[REDACTED]` in `tool.arguments.parent_command_line`.
+Join the two phases using `tool.arguments.call_id`. Use `session_id` to group
+related calls.
+
+| Phase | Spoor event | Meaning |
+| --- | --- | --- |
+| `authorization` | `tool_authorized` | Policy allowed the request. Execution is pending. |
+| `authorization` | `tool_denied` or `approval_request` | Policy blocked the request or required approval. |
+| `completion` | `tool_called` or `tool_failed` | The shim reported exit code 0 or a nonzero exit code in `tool.arguments.exit_code`. |
 
 ## Detection rules
 
-- [Sigma](detections/sigma) covers brokered tool activity with ARTEX or shell
-  parent metadata, plus web log signals such as ARTEX user agents.
+- [Sigma](detections/sigma) covers brokered completion reports with ARTEX or
+  shell parent metadata, plus web log signals such as ARTEX user agents. The
+  process rule uses the phase field preserved in stored Agentmetry events.
 - [Suricata](detections/suricata/artex-lab.rules) looks for ARTEX HTTP signals
   where the relevant traffic is visible.
 - [TraceSig](detections/tracesig/lab_rules.yml) looks for sequences across the
@@ -87,7 +95,7 @@ the event and your environment's baseline.
 | `rust/spoor-shim` | Tool mediation and Linux parent command capture |
 | `rust/policy.json` | Example policy from the local lab |
 | `detections` | Experimental Sigma, Suricata, and TraceSig rules |
-| `examples` | Synthetic broker trail used in the quick start |
+| `examples` | A sample broker trail |
 
 ## Verification
 
@@ -95,16 +103,15 @@ the event and your environment's baseline.
 checkout, runs the Rust tests and this quick start, and checks the Sigma
 process fixtures on Linux and Windows.
 
-The source lab passed 42 Rust tests with one ignored benchmark and 77 replay
-cases. Those replay cases belong to the source lab. The quick start and Sigma
-fixtures above are included in this repository.
+The live loopback check read four stored events back from Agentmetry. Two
+distinct call IDs shared one session and each linked the authorization
+to its exit code and outcome. The tested instance normalizes both phases to
+`action.type=tool_called`. Query by `tool.arguments.phase` to distinguish
+them. The source topic retains the original Spoor event name.
 
-An isolated Spoor broker and watcher also delivered a synthetic decision and
-failure to a running Agentmetry instance. Both events were read back with the
-same session and correlation ID and a redacted
-`tool.arguments.parent_command_line`. Agentmetry recorded the failure as
-`action.type=tool_called` with an error outcome and retained `tool_failed` in
-the source topic. The check used synthetic telemetry on loopback.
+Earlier broker trails with call IDs can be read through the updated watcher.
+Consumers that used `tool_called` as a policy decision should use the
+authorization phase going forward.
 
 Build and test the Rust workspace.
 
@@ -124,6 +131,11 @@ python scripts/evaluate_lab_sigma.py
 The broker listens on loopback by default and assumes a trusted client. Use
 operating system and network controls for isolation. Review the example
 policy, which permits unmatched commands.
+
+Set `SPOOR_STRICT_AUDIT=1` on the broker to refuse otherwise allowed calls if
+the decision cannot be appended to the local trail. Audit write errors are
+logged in both modes. An unrecorded completion is rejected by the broker and
+reported by the shim.
 
 Audit trails can contain command arguments and model prompt content. Parent
 command redaction covers common credential patterns. For audit data handling

@@ -380,11 +380,13 @@ struct BrokerState {
     events: PathBuf,
     approvals: PathBuf,
     pending_reports: Arc<Mutex<HashMap<String, PendingCall>>>,
+    strict_audit: bool,
 }
 
 #[derive(Clone)]
 struct PendingCall {
     tool: String,
+    command: String,
     session: String,
     parent_command_line: Option<String>,
     issued_at: u64,
@@ -417,6 +419,7 @@ async fn broker_with_ready(args: &[String], ready: Option<tokio::sync::oneshot::
         events: data.join("broker-events.jsonl"),
         approvals,
         pending_reports: Arc::new(Mutex::new(HashMap::new())),
+        strict_audit: std::env::var("SPOOR_STRICT_AUDIT").ok().as_deref() == Some("1"),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -429,7 +432,10 @@ async fn broker_with_ready(args: &[String], ready: Option<tokio::sync::oneshot::
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .unwrap_or_else(|err| panic!("bind broker {}: {}", listen, err));
-    println!("[spoor-rs] broker on http://{}", listen);
+    println!(
+        "[spoor-rs] broker on http://{}",
+        listener.local_addr().expect("read broker address")
+    );
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
@@ -591,6 +597,7 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
                 call_id.clone(),
                 PendingCall {
                     tool: tool.clone(),
+                    command: command.clone(),
                     session: session.clone(),
                     parent_command_line: parent_command_line.clone(),
                     issued_at: now,
@@ -610,35 +617,7 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
     if let Some(approved) = decision.approved {
         response["approved"] = json!(approved);
     }
-    if let Some(info) = taint_info {
-        let mut event = with_parent_command_line(
-            json!({
-                "type": "decide",
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                "call_id": call_id,
-                "session": session,
-                "task": task,
-                "tool": tool,
-                "argv": argv,
-                "command": command,
-                "decision": response["decision"],
-                "rule_id": response["rule_id"],
-                "reason": response["reason"],
-            }),
-            parent_command_line.as_deref(),
-        );
-        event["taint"] = serde_json::to_value(info).unwrap_or(Value::Null);
-        if !framework_match.is_empty() {
-            event["framework_match"] =
-                serde_json::to_value(&framework_match).unwrap_or(Value::Null);
-        }
-        append_jsonl(&state.events, &event);
-        if decision.tainted == Some(true) {
-            response["tainted"] = json!(true);
-        }
-        return Json(response);
-    }
-    let event = with_parent_command_line(
+    let mut event = with_parent_command_line(
         json!({
             "type": "decide",
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -654,11 +633,28 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
         }),
         parent_command_line.as_deref(),
     );
-    let mut event = event;
+    if let Some(info) = taint_info {
+        event["taint"] = serde_json::to_value(info).unwrap_or(Value::Null);
+        if decision.tainted == Some(true) {
+            response["tainted"] = json!(true);
+        }
+    }
     if !framework_match.is_empty() {
         event["framework_match"] = serde_json::to_value(&framework_match).unwrap_or(Value::Null);
     }
-    append_jsonl(&state.events, &event);
+    if !append_jsonl(&state.events, &event) {
+        if state.strict_audit && decision.decision == "allow" {
+            state.pending_reports.lock().unwrap().remove(&call_id);
+            return Json(json!({
+                "call_id": call_id,
+                "decision": "deny",
+                "rule_id": "audit-unavailable",
+                "reason": "strict audit requires a writable decision trail",
+                "audit_recorded": false,
+            }));
+        }
+        response["audit_recorded"] = json!(false);
+    }
     Json(response)
 }
 
@@ -681,24 +677,28 @@ async fn report(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
     if pending_call.tool != tool {
         return Json(json!({"ok": false, "reason": "tool does not match call_id"}));
     }
-    // Keep the decision-time session and parent command for the matching call.
-    let session = pending_call.session.clone();
-    let parent_command_line = pending_call.parent_command_line.clone();
-    pending.remove(call_id);
-    drop(pending);
-    let event = with_parent_command_line(
+    // Keep the decision-time session, command, and parent metadata.
+    let mut event = with_parent_command_line(
         json!({
             "type": "report",
             "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "call_id": call_id,
-            "session": session,
+            "session": pending_call.session,
             "tool": tool,
+            "command": pending_call.command,
             "exit_code": exit_code,
             "duration_ms": duration_ms,
         }),
-        parent_command_line.as_deref(),
+        pending_call.parent_command_line.as_deref(),
     );
-    append_jsonl(&state.events, &event);
+    let framework_match = spoor_core::ioc::scan(&pending_call.command);
+    if !framework_match.is_empty() {
+        event["framework_match"] = serde_json::to_value(&framework_match).unwrap_or(Value::Null);
+    }
+    if !append_jsonl(&state.events, &event) {
+        return Json(json!({"ok": false, "reason": "audit-unavailable"}));
+    }
+    pending.remove(call_id);
     Json(json!({"ok": true}))
 }
 
@@ -738,22 +738,38 @@ fn with_parent_command_line(mut event: Value, parent: Option<&str>) -> Value {
 }
 
 fn call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{:x}{:x}",
+        "{:x}-{:x}-{:x}",
         std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed),
     )
 }
 
-fn append_jsonl(path: &Path, value: &Value) {
+fn append_jsonl(path: &Path, value: &Value) -> bool {
     static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = APPEND_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(format!("{}\n", value).as_bytes())
+    })();
+    if let Err(err) = result {
+        eprintln!(
+            "[spoor-rs] audit append failed for {}: {}",
+            path.display(),
+            err
+        );
+        return false;
     }
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{}", value);
-    }
+    true
 }
 
 // ------------------------------------------------------------------- watch
@@ -1240,15 +1256,19 @@ async fn run_broker_loop(
                                     continue;
                                 }
                             };
-                            let dedupe_key = dedupe.as_ref().map(|_| {
-                                DedupeStore::key(
-                                    &event.tool,
-                                    event.command.as_deref().unwrap_or(""),
-                                    event.ts.as_deref(),
-                                )
-                            });
+                            let dedupe_key =
+                                (dedupe.is_some() && event.kind == "report").then(|| {
+                                    DedupeStore::key(
+                                        &event.tool,
+                                        event.command.as_deref().unwrap_or(""),
+                                        event.ts.as_deref(),
+                                    )
+                                });
                             for mut payload in map_event(&event) {
-                                if payload.event_type == "tool_called" {
+                                if matches!(
+                                    payload.event_type.as_str(),
+                                    "tool_called" | "tool_failed"
+                                ) {
                                     if let Some(tracker) = &intent {
                                         let key = event
                                             .session
@@ -1448,13 +1468,20 @@ fn deliver_ingest(
         dedupe.map(|store| store.lock().unwrap())
     };
     if let (Some(store), Some(dedupe_key)) = (store_guard.as_mut(), dedupe_key.as_deref()) {
-        if store.is_cross_duplicate(source, dedupe_key) {
+        // Direct history may duplicate an execution, but cannot replace the
+        // paired completion of a broker call.
+        let broker_completion =
+            source == "broker" && payload.tool.arguments["call_id"].as_str().is_some();
+        if !broker_completion && store.is_cross_duplicate(source, dedupe_key) {
             return Delivery::Duplicate;
         }
     }
     if dry_run {
-        append_jsonl(preview, &serde_json::to_value(payload).unwrap());
-        return Delivery::Sent;
+        return if append_jsonl(preview, &serde_json::to_value(payload).unwrap()) {
+            Delivery::Sent
+        } else {
+            Delivery::Failed
+        };
     }
     if post_payload(base, payload, key) {
         if let (Some(store), Some(dedupe_key)) = (store_guard.as_mut(), dedupe_key) {
@@ -1877,6 +1904,11 @@ fn export_agentmetry_trail(engine: &Engine, text: &str, lines: &mut Vec<String>)
         };
         let event = value.get("event").cloned().unwrap_or_else(|| value.clone());
         let action = &event["action"];
+        let arguments = &event["tool"]["arguments"];
+        if arguments["phase"] == "completion" {
+            // TraceSig sequences use decisions, as in the broker export.
+            continue;
+        }
         let action_type = action["type"].as_str().unwrap_or("");
         if action_type != "tool_called" && action_type != "tool_failed" {
             continue;
@@ -1891,7 +1923,11 @@ fn export_agentmetry_trail(engine: &Engine, text: &str, lines: &mut Vec<String>)
             .or(event["tool"]["qualified"].as_str())
             .unwrap_or("tool")
             .to_string();
-        let mut command = event["tool"]["command"].as_str().unwrap_or("").to_string();
+        let mut command = event["tool"]["command"]
+            .as_str()
+            .or_else(|| arguments["command"].as_str())
+            .unwrap_or("")
+            .to_string();
         if command.is_empty() {
             let qualified = event["tool"]["qualified"]
                 .as_str()
@@ -1912,6 +1948,13 @@ fn export_agentmetry_trail(engine: &Engine, text: &str, lines: &mut Vec<String>)
         *counter += 1;
         let verdict = match action["outcome"].as_str().unwrap_or("success") {
             "denied" => "deny",
+            "pending"
+                if event["source_topic"]
+                    .as_str()
+                    .is_some_and(|topic| topic.ends_with("/tool_authorized")) =>
+            {
+                "allow"
+            }
             "pending" => "review",
             _ => "allow",
         };

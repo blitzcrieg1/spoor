@@ -59,38 +59,40 @@ fn main() {
         eprintln!("[spoor-shim] {}: {}", decision, body);
         std::process::exit(126);
     }
+    if call_id.is_empty() {
+        eprintln!("[spoor-shim] broker allowed the call without a call ID");
+        std::process::exit(126);
+    }
 
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from));
-    let real = match resolve_tool(&tool, exe_dir.as_deref()) {
-        Some(path) => path,
-        None => {
-            eprintln!("[spoor-shim] allowed but real '{}' not found on PATH", tool);
-            std::process::exit(127);
-        }
-    };
     // Keep the shim directory on PATH for child processes launched by a shell
     // or script. The direct executable path above avoids recursion here.
     let child_path = std::env::var("PATH").unwrap_or_default();
     let started = Instant::now();
-    let status = match Command::new(&real)
-        .args(&argv)
-        .env("PATH", &child_path)
-        .spawn()
-    {
-        Ok(mut child) => {
-            #[cfg(unix)]
-            install_signal_forwarding(child.id() as i32);
-            let status = child.wait();
-            #[cfg(unix)]
-            CHILD_PID.store(0, Ordering::SeqCst);
-            status.map(|status| exit_code(&status)).unwrap_or(127)
+    let status = if let Some(real) = resolve_tool(&tool, exe_dir.as_deref()) {
+        match Command::new(&real)
+            .args(&argv)
+            .env("PATH", &child_path)
+            .spawn()
+        {
+            Ok(mut child) => {
+                #[cfg(unix)]
+                install_signal_forwarding(child.id() as i32);
+                let status = child.wait();
+                #[cfg(unix)]
+                CHILD_PID.store(0, Ordering::SeqCst);
+                status.map(|status| exit_code(&status)).unwrap_or(127)
+            }
+            Err(err) => {
+                eprintln!("[spoor-shim] failed to launch {}: {}", tool, err);
+                127
+            }
         }
-        Err(err) => {
-            eprintln!("[spoor-shim] failed to launch {}: {}", tool, err);
-            127
-        }
+    } else {
+        eprintln!("[spoor-shim] allowed but real '{}' not found on PATH", tool);
+        127
     };
     let report = build_report_payload(
         &call_id,
@@ -99,10 +101,21 @@ fn main() {
         started.elapsed().as_millis() as u64,
         parent_command_line.as_deref(),
     );
-    let _ = post_json(
+    let recorded = post_json(
         &format!("{}/report", broker.trim_end_matches('/')),
         &report.to_string(),
-    );
+    )
+    .ok()
+    .filter(|(status, _)| *status == 200)
+    .and_then(|(_, body)| serde_json::from_str::<Value>(&body).ok())
+    .and_then(|body| body["ok"].as_bool())
+    .unwrap_or(false);
+    if !recorded {
+        eprintln!(
+            "[spoor-shim] completion was not acknowledged for call {}",
+            call_id
+        );
+    }
     std::process::exit(status);
 }
 
