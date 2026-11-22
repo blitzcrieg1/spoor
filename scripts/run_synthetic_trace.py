@@ -132,18 +132,71 @@ def check_strict_mode(spoor, shim, directory, env):
     print("Strict audit refused a call when the decision trail was unavailable.")
 
 
+def check_ingest_recovery(spoor, shim, directory, env, reject_completion, received):
+    directory.mkdir()
+    queue = directory / "failed-queue.rust.jsonl"
+    queue.mkdir()
+    checkpoint = directory / "spoor.rust-state.json"
+    events_before = len(received)
+
+    def wait_for_offset(expected):
+        for _ in range(150):
+            if checkpoint.exists() and json.loads(checkpoint.read_text(encoding="utf-8"))["offset"] == expected:
+                return
+            time.sleep(0.05)
+        raise SystemExit(f"Watcher did not reach the expected checkpoint at byte {expected}.")
+
+    with running_broker(spoor, directory, env) as broker_env:
+        run_calls(shim, broker_env)
+        trail = (directory / TRAIL).read_bytes()
+        prefix_end = trail.index(b"\n") + 1
+        reject_completion.set()
+        with (directory / "watcher.log").open("wb") as log:
+            with subprocess.Popen(
+                [spoor, "watch", "--policy", POLICY], cwd=ROOT, env=broker_env,
+                stdout=log, stderr=subprocess.STDOUT,
+            ) as watcher:
+                try:
+                    wait_for_offset(prefix_end)
+                    for _ in range(100):
+                        log_text = (directory / "watcher.log").read_text(encoding="utf-8", errors="replace")
+                        if "broker trail checkpoint held" in log_text:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise SystemExit("Watcher did not report the blocked checkpoint.")
+                    require(len(received) == events_before + 1,
+                            "Watcher attempted events after an unsaved completion.")
+                    reject_completion.clear()
+                    queue.rmdir()
+                    wait_for_offset(len(trail))
+                    require(len(received) == events_before + 4,
+                            "Recovery lost an event or repeated the acknowledged prefix.")
+                finally:
+                    reject_completion.clear()
+                    if watcher.poll() is None:
+                        watcher.terminate()
+                    watcher.wait(timeout=5)
+    print("Watcher held its checkpoint and resumed after the failed delivery recovered.")
+
+
 def main():
     spoor, shim = binaries()
     demo_dir = ROOT / ".spoor-demo"
     demo_dir.mkdir(exist_ok=True)
     received = []
+    reject_completion = threading.Event()
 
     class Collector(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path != "/api/v1/audit/ingest":
                 self.send_error(404)
                 return
-            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if reject_completion.is_set() and payload["tool"]["arguments"]["phase"] == "completion":
+                self.send_error(400)
+                return
+            received.append(payload)
             self.send_response(204)
             self.end_headers()
 
@@ -163,10 +216,13 @@ def main():
                 with running_broker(spoor, directory, env) as broker_env:
                     run_calls(shim, broker_env)
                     forward_trace(spoor, broker_env)
+                check_pairs(directory, received, SESSION)
+                check_ingest_recovery(
+                    spoor, shim, directory / "ingest-recovery", env, reject_completion, received,
+                )
             finally:
                 server.shutdown()
                 thread.join()
-        check_pairs(directory, received, SESSION)
         check_strict_mode(spoor, shim, directory / "strict-audit", env)
 
 

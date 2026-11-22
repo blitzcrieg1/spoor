@@ -44,7 +44,8 @@ Use a stable Rust toolchain with Cargo and Python 3.10 or newer. The same
 command works in PowerShell and Bash. It starts the real shim, broker, and
 watcher with a loopback mock collector. Two harmless tool calls share one
 session, with exit codes 0 and 7. The demo checks each decision against its
-own completion and checks that strict audit refuses a call it cannot record.
+own completion, simulates a collector and retry queue outage, and checks that
+strict audit refuses a call it cannot record.
 
 ```sh
 python scripts/run_synthetic_trace.py
@@ -136,6 +137,18 @@ Set `SPOOR_STRICT_AUDIT=1` on the broker to refuse otherwise allowed calls if
 the decision cannot be appended to the local trail. Audit write errors are
 logged in both modes. An unrecorded completion is rejected by the broker and
 reported by the shim.
+
+The watcher holds its checkpoint when it can neither deliver an event nor
+flush it to the local retry queue. A running watcher retries from the blocked
+record. Queued events are replayed at startup. A single run returns an error
+if it is blocked. Delivery can repeat after a restart or an ambiguous ingest
+response, so consumers should handle duplicate events.
+
+The optional HTTPS proxy uses the platform TLS trust store and keeps request
+headers and bodies in memory. It connects directly to its configured upstream
+and returns redirects to the caller. Linux source builds need the OpenSSL
+development libraries. The Linux HTTPS test also uses the `openssl` executable
+to create a temporary loopback certificate.
 
 Audit trails can contain command arguments and model prompt content. Parent
 command redaction covers common credential patterns. For audit data handling

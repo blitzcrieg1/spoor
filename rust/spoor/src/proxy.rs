@@ -5,9 +5,7 @@
 //! `llm-events.jsonl`. Logging is best-effort: a failure to record must never
 //! break the client↔LLM connection.
 //!
-//! Upstream transport: plain HTTP is native. HTTPS is delegated to the `curl`
-//! binary (no TLS crate is available in the offline build); streaming is
-//! preserved with `curl -N`.
+//! HTTPS uses an in-process TLS client. Plain HTTP uses the local TCP transport.
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -37,7 +35,6 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-const CURL_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Converts the reader task's channel into a `TryStream` for `Body::from_stream`.
@@ -99,7 +96,7 @@ pub async fn run(
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|err| format!("bind {}: {}", listen, err))?;
-    println!("[spoor-proxy] {} -> {}", listen, upstream);
+    println!("[spoor-proxy] {} -> {}", listen, host_from_url(&upstream));
     axum::serve(listener, app)
         .await
         .map_err(|err| format!("serve: {}", err))
@@ -216,12 +213,20 @@ async fn forward(
         )
         .await
     } else if url.starts_with("https://") {
-        forward_curl(
-            state, method, &url, headers, body, request, timestamp, streaming,
+        forward_https(
+            tls_client()?,
+            state,
+            method,
+            &url,
+            headers,
+            body,
+            request,
+            timestamp,
+            streaming,
         )
         .await
     } else {
-        Err(format!("unsupported upstream scheme: {}", url))
+        Err("unsupported upstream scheme".to_string())
     }
 }
 
@@ -353,51 +358,6 @@ fn connection_tokens(headers: &HeaderMap) -> HashSet<String> {
         .map(|token| token.trim().to_ascii_lowercase())
         .filter(|token| !token.is_empty())
         .collect()
-}
-
-async fn wait_curl_headers(path: &std::path::Path, timeout: std::time::Duration) -> HeaderMap {
-    let started = std::time::Instant::now();
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if text.contains("\r\n\r\n") {
-                return parse_curl_headers(&text);
-            }
-        }
-        if started.elapsed() >= timeout {
-            return std::fs::read_to_string(path)
-                .map(|text| parse_curl_headers(&text))
-                .unwrap_or_default();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-fn parse_curl_headers(text: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    let mut in_block = false;
-    for line in text.lines() {
-        if line.starts_with("HTTP/") {
-            headers = HeaderMap::new();
-            in_block = true;
-            continue;
-        }
-        if !in_block {
-            continue;
-        }
-        if line.trim().is_empty() {
-            in_block = false;
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            if let (Ok(name), Ok(value)) = (
-                name.trim().parse::<axum::http::HeaderName>(),
-                value.trim().parse::<axum::http::HeaderValue>(),
-            ) {
-                headers.insert(name, value);
-            }
-        }
-    }
-    headers
 }
 
 fn arguments_to_argv(arguments: &str) -> Vec<String> {
@@ -773,7 +733,26 @@ async fn forward_http(
     Ok(response)
 }
 
-async fn forward_curl(
+fn https_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .http1_only()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(BODY_TIMEOUT)
+}
+
+fn tls_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| https_client_builder().build())
+        .as_ref()
+        .map_err(|err| format!("initialize HTTPS client: {}", err))
+}
+
+async fn forward_https(
+    client: &reqwest::Client,
     state: &ProxyState,
     method: &str,
     url: &str,
@@ -783,55 +762,33 @@ async fn forward_curl(
     timestamp: &str,
     streaming: bool,
 ) -> Result<Response, String> {
-    let header_path = state.data_dir.join(format!(
-        ".curl-{}-{}.hdr",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    ));
-    if let Some(parent) = header_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let target = reqwest::Url::parse(url).map_err(|_| "invalid HTTPS upstream URL".to_string())?;
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err("HTTPS upstream URL must not contain credentials".to_string());
     }
-    let mut command = tokio::process::Command::new("curl");
-    command
-        .arg("-sS")
-        .arg("-N")
-        .arg("--http1.1")
-        .arg("--connect-timeout")
-        .arg("10")
-        .arg("--max-time")
-        .arg("300")
-        .arg("-D")
-        .arg(&header_path)
-        .arg("-X")
-        .arg(method)
-        .arg(url)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+    let method = method
+        .parse::<reqwest::Method>()
+        .map_err(|_| "invalid HTTP method".to_string())?;
+    let enforce_here = state.enforce
+        && method == reqwest::Method::POST
+        && target.path().contains("/chat/completions");
+    let mut upstream_request = client
+        .request(method, target)
+        .header("accept-encoding", "identity")
+        .body(body.to_vec());
     for (name, value) in forward_headers(headers, state.api_key.as_deref()) {
-        command.arg("-H").arg(format!("{}: {}", name, value));
+        let mut value = value
+            .parse::<axum::http::HeaderValue>()
+            .map_err(|_| "invalid upstream header value".to_string())?;
+        value.set_sensitive(true);
+        upstream_request = upstream_request.header(name, value);
     }
-    command.arg("--data-binary").arg("@-");
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("spawn curl (https upstream needs curl): {}", err))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(body).await;
-    }
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_curl(&mut child, &header_path).await;
-        return Err("curl stdout unavailable".to_string());
-    };
-    // curl knows the HTTP status once headers arrive; wait for it instead of
-    // pretending a failed TLS/DNS connection was a 200.
-    let status = match wait_curl_status(&header_path, &mut child, CURL_HEADER_TIMEOUT).await {
-        Ok(status) => status,
-        Err(err) => {
-            terminate_curl(&mut child, &header_path).await;
-            return Err(format!("upstream curl failed: {}", err));
-        }
-    };
-    let response_headers = wait_curl_headers(&header_path, std::time::Duration::from_secs(2)).await;
+    let mut upstream = tokio::time::timeout(HEAD_TIMEOUT, upstream_request.send())
+        .await
+        .map_err(|_| "HTTPS response header timeout".to_string())?
+        .map_err(|err| format!("HTTPS upstream request failed: {}", err.without_url()))?;
+    let status = upstream.status();
+    let response_headers = upstream.headers().clone();
     let content_type = header_value(&response_headers, "content-type").unwrap_or_else(|| {
         if streaming {
             "text/event-stream"
@@ -840,153 +797,89 @@ async fn forward_curl(
         }
         .to_string()
     });
-    let enforce_here =
-        state.enforce && method.eq_ignore_ascii_case("POST") && url.contains("/chat/completions");
-    if enforce_here {
-        let buffer = match read_curl_body(&mut stdout).await {
-            Ok(buffer) => buffer,
-            Err(err) => {
-                terminate_curl(&mut child, &header_path).await;
-                return Err(err);
-            }
-        };
-        match tokio::time::timeout(BODY_TIMEOUT, child.wait()).await {
-            Ok(Ok(exit)) if exit.success() => {}
-            Ok(Ok(exit)) => {
-                let _ = std::fs::remove_file(&header_path);
-                return Err(format!("curl exited {}", exit));
-            }
-            Ok(Err(err)) => {
-                let _ = std::fs::remove_file(&header_path);
-                return Err(format!("curl wait failed: {}", err));
-            }
-            Err(_) => {
-                terminate_curl(&mut child, &header_path).await;
-                return Err("curl process wait timeout".to_string());
-            }
-        }
-        let _ = std::fs::remove_file(&header_path);
-        if buffer.len() <= MAX_RECORD {
-            record(state, request, &buffer, &content_type, headers, timestamp);
-        }
-        if let Some((refusal, refusal_type)) =
-            enforce_turn(state, request, &buffer, &content_type, headers, timestamp).await
-        {
-            let mut response = Response::new(Body::from(refusal));
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                "content-type",
-                refusal_type
-                    .parse()
-                    .unwrap_or_else(|_| "application/json".parse().unwrap()),
-            );
-            return Ok(response);
-        }
-        let mut response = Response::new(Body::from(buffer));
-        *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-        copy_response_headers(&response_headers, response.headers_mut());
-        response.headers_mut().insert(
-            "content-type",
-            content_type
-                .parse()
-                .unwrap_or_else(|_| "application/json".parse().unwrap()),
-        );
-        return Ok(response);
-    }
-    if streaming {
+
+    let body = if streaming && !enforce_here {
         let (tx, rx) = mpsc::channel::<Bytes>(16);
-        let state: ProxyState = state.clone();
-        let request = request.clone();
-        let headers = headers.clone();
-        let timestamp = timestamp.to_string();
-        let header_path = header_path.clone();
-        let content_type_for_record = content_type.clone();
+        let (state, request, headers, timestamp, recorded_type) = (
+            state.clone(),
+            request.clone(),
+            headers.clone(),
+            timestamp.to_string(),
+            content_type.clone(),
+        );
         tokio::spawn(async move {
-            let mut buffer = Vec::new();
-            let mut chunk = vec![0u8; 16 * 1024];
-            let mut aborted = false;
+            let mut preview = Vec::new();
             let mut total = 0usize;
             loop {
-                match tokio::time::timeout(BODY_TIMEOUT, stdout.read(&mut chunk)).await {
-                    Ok(Ok(0)) => break,
-                    Ok(Err(_)) | Err(_) => {
-                        aborted = true;
-                        break;
+                let bytes = match upstream.chunk().await {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break,
+                    Err(err) => {
+                        eprintln!(
+                            "[spoor-proxy] HTTPS stream ended early: {}",
+                            err.without_url()
+                        );
+                        return;
                     }
-                    Ok(Ok(read)) => {
-                        if total.saturating_add(read) > MAX_BODY {
-                            aborted = true;
-                            break;
-                        }
-                        total += read;
-                        let bytes = Bytes::copy_from_slice(&chunk[..read]);
-                        if buffer.len() < MAX_RECORD {
-                            buffer.extend_from_slice(&bytes);
-                        }
-                        if tx.send(bytes).await.is_err() {
-                            aborted = true;
-                            break;
-                        }
-                    }
+                };
+                total += bytes.len();
+                if total > MAX_BODY {
+                    eprintln!("[spoor-proxy] HTTPS stream exceeded response limit");
+                    return;
+                }
+                if total <= MAX_RECORD {
+                    preview.extend_from_slice(&bytes);
+                }
+                if tx.send(bytes).await.is_err() {
+                    return;
                 }
             }
-            if aborted {
-                let _ = child.kill().await;
-            }
-            let _ = tokio::time::timeout(BODY_TIMEOUT, child.wait()).await;
-            let _ = std::fs::remove_file(&header_path);
             drop(tx);
-            if !aborted && buffer.len() <= MAX_RECORD {
+            if total <= MAX_RECORD {
                 record(
                     &state,
                     &request,
-                    &buffer,
-                    &content_type_for_record,
+                    &preview,
+                    &recorded_type,
                     &headers,
                     &timestamp,
                 );
             }
         });
-        let body_stream = ChannelStream { rx };
-        let mut response = Response::new(Body::from_stream(body_stream));
-        *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-        copy_response_headers(&response_headers, response.headers_mut());
-        response.headers_mut().insert(
-            "content-type",
-            content_type
-                .parse()
-                .unwrap_or_else(|_| "text/event-stream".parse().unwrap()),
-        );
-        return Ok(response);
-    }
-    let buffer = match read_curl_body(&mut stdout).await {
-        Ok(buffer) => buffer,
-        Err(err) => {
-            terminate_curl(&mut child, &header_path).await;
-            return Err(err);
+        Body::from_stream(ChannelStream { rx })
+    } else {
+        let mut buffer = Vec::new();
+        while let Some(bytes) = upstream
+            .chunk()
+            .await
+            .map_err(|err| format!("read HTTPS response: {}", err.without_url()))?
+        {
+            if buffer.len() + bytes.len() > MAX_BODY {
+                return Err("HTTPS response exceeded response limit".to_string());
+            }
+            buffer.extend_from_slice(&bytes);
         }
+        if buffer.len() <= MAX_RECORD {
+            record(state, request, &buffer, &content_type, headers, timestamp);
+        }
+        if enforce_here {
+            if let Some((refusal, refusal_type)) =
+                enforce_turn(state, request, &buffer, &content_type, headers, timestamp).await
+            {
+                let mut response = Response::new(Body::from(refusal));
+                response.headers_mut().insert(
+                    "content-type",
+                    refusal_type
+                        .parse()
+                        .unwrap_or_else(|_| "application/json".parse().unwrap()),
+                );
+                return Ok(response);
+            }
+        }
+        Body::from(buffer)
     };
-    match tokio::time::timeout(BODY_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => {
-            let _ = std::fs::remove_file(&header_path);
-            return Err(format!("curl exited {}", status));
-        }
-        Ok(Err(err)) => {
-            let _ = std::fs::remove_file(&header_path);
-            return Err(format!("curl wait failed: {}", err));
-        }
-        Err(_) => {
-            terminate_curl(&mut child, &header_path).await;
-            return Err("curl process wait timeout".to_string());
-        }
-    }
-    let _ = std::fs::remove_file(&header_path);
-    if buffer.len() <= MAX_RECORD {
-        record(state, request, &buffer, &content_type, headers, timestamp);
-    }
-    let mut response = Response::new(Body::from(buffer));
-    *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
     copy_response_headers(&response_headers, response.headers_mut());
     response.headers_mut().insert(
         "content-type",
@@ -995,76 +888,6 @@ async fn forward_curl(
             .unwrap_or_else(|_| "application/json".parse().unwrap()),
     );
     Ok(response)
-}
-
-async fn terminate_curl(child: &mut tokio::process::Child, header_path: &std::path::Path) {
-    let _ = child.kill().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-    let _ = std::fs::remove_file(header_path);
-}
-
-async fn read_curl_body(stdout: &mut tokio::process::ChildStdout) -> Result<Vec<u8>, String> {
-    let read = tokio::time::timeout(BODY_TIMEOUT, async {
-        let mut buffer = Vec::new();
-        let mut chunk = vec![0u8; 16 * 1024];
-        loop {
-            let count = stdout.read(&mut chunk).await?;
-            if count == 0 {
-                return Ok::<_, io::Error>(buffer);
-            }
-            if count > MAX_BODY.saturating_sub(buffer.len()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "upstream body too large",
-                ));
-            }
-            buffer.extend_from_slice(&chunk[..count]);
-        }
-    })
-    .await;
-    match read {
-        Ok(Ok(buffer)) => Ok(buffer),
-        Ok(Err(err)) => Err(format!("read curl body: {}", err)),
-        Err(_) => Err("curl body timeout".to_string()),
-    }
-}
-
-async fn wait_curl_status(
-    path: &std::path::Path,
-    child: &mut tokio::process::Child,
-    timeout: std::time::Duration,
-) -> Result<u16, String> {
-    let started = std::time::Instant::now();
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Some(status) = parse_http_status(&text) {
-                return Ok(status);
-            }
-        }
-        match child.try_wait() {
-            Ok(Some(exit)) => {
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    if let Some(status) = parse_http_status(&text) {
-                        return Ok(status);
-                    }
-                }
-                return Err(format!("curl exited {} without an HTTP status", exit));
-            }
-            Ok(None) => {}
-            Err(err) => return Err(format!("curl wait failed: {}", err)),
-        }
-        if started.elapsed() >= timeout {
-            return Err("curl header timeout".to_string());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
-fn parse_http_status(text: &str) -> Option<u16> {
-    text.lines()
-        .filter(|line| line.starts_with("HTTP/"))
-        .filter_map(|line| line.split_whitespace().nth(1)?.parse().ok())
-        .last()
 }
 
 async fn read_line_timeout(
@@ -1407,7 +1230,7 @@ fn record(
 
 fn host_from_url(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = rest.split('/').next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     authority
         .rsplit_once('@')
         .map(|(_, host)| host)
@@ -1437,6 +1260,115 @@ fn plain(status: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn https_keeps_headers_and_body_in_process_and_preserves_redirect_status() {
+        use super::*;
+        use tokio::io::AsyncBufReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("test-cert.pem");
+        let key = dir.path().join("test-key.pem");
+        let generated = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "could not generate fixture certificate"
+        );
+        let pem = std::fs::read(cert).unwrap();
+        let identity =
+            native_tls::Identity::from_pkcs8(&pem, &std::fs::read(key).unwrap()).unwrap();
+        let acceptor =
+            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!(
+            "https://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let expected_body = b"{\"stream\":true}\0\r\n";
+        let reply_body = b"data: [DONE]\n\n";
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(acceptor.accept(stream).await.unwrap());
+            let mut headers = String::new();
+            loop {
+                let before = headers.len();
+                assert_ne!(stream.read_line(&mut headers).await.unwrap(), 0);
+                if &headers[before..] == "\r\n" {
+                    break;
+                }
+            }
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+            assert!(headers.lines().any(|line| {
+                line.split_once(": ").is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization") && value == "Bearer fixture-token"
+                })
+            }));
+            let mut received = vec![0; expected_body.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected_body);
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:1/elsewhere\r\n\
+                 Content-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply_body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            stream.write_all(reply_body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let client = https_client_builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
+            .build()
+            .unwrap();
+        let state = ProxyState {
+            upstream: upstream_url.clone(),
+            data_dir: dir.path().to_path_buf(),
+            api_key: Some("fixture-token".to_string()),
+            enforce: false,
+            preflight_url: None,
+            context_url: None,
+        };
+        let response = forward_https(
+            &client,
+            &state,
+            "POST",
+            &upstream_url,
+            &HeaderMap::new(),
+            expected_body,
+            &serde_json::json!({"stream": true}),
+            "fixture",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            reply_body
+        );
+        server.await.unwrap();
+    }
+
     use super::*;
     use axum::routing::post;
     use serde_json::json;
@@ -1572,17 +1504,6 @@ mod tests {
         let out = forward_headers(&headers, Some("secret"));
         assert!(out.iter().any(|(_, value)| value == "Bearer real"));
         assert!(!out.iter().any(|(_, value)| value == "Bearer secret"));
-    }
-
-    #[test]
-    fn parses_curl_header_blocks() {
-        let text = "HTTP/1.1 200 OK\r\nX-RateLimit-Remaining: 42\r\nContent-Type: application/json\r\n\r\n";
-        let headers = parse_curl_headers(text);
-        assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "42");
-        let redirects = "HTTP/1.1 302 Found\r\nLocation: /next\r\n\r\nHTTP/1.1 200 OK\r\nX-Request-Id: abc\r\n\r\n";
-        let headers = parse_curl_headers(redirects);
-        assert_eq!(headers.get("x-request-id").unwrap(), "abc");
-        assert!(headers.get("location").is_none());
     }
 
     #[test]

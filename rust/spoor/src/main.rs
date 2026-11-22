@@ -29,8 +29,11 @@ fn main() {
         }
         Some("watch") => {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-            runtime.block_on(watch(&args));
-            0
+            if runtime.block_on(watch(&args)) {
+                0
+            } else {
+                1
+            }
         }
         Some("proxy") => {
             let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -749,6 +752,14 @@ fn call_id() -> String {
 }
 
 fn append_jsonl(path: &Path, value: &Value) -> bool {
+    append_jsonl_with_sync(path, value, false)
+}
+
+fn append_durable_jsonl(path: &Path, value: &Value) -> bool {
+    append_jsonl_with_sync(path, value, true)
+}
+
+fn append_jsonl_with_sync(path: &Path, value: &Value, sync: bool) -> bool {
     static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = APPEND_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let result = (|| -> std::io::Result<()> {
@@ -759,7 +770,15 @@ fn append_jsonl(path: &Path, value: &Value) -> bool {
             .create(true)
             .append(true)
             .open(path)?;
-        file.write_all(format!("{}\n", value).as_bytes())
+        file.write_all(format!("{}\n", value).as_bytes())?;
+        if sync {
+            file.sync_all()?;
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        Ok(())
     })();
     if let Err(err) = result {
         eprintln!(
@@ -774,7 +793,7 @@ fn append_jsonl(path: &Path, value: &Value) -> bool {
 
 // ------------------------------------------------------------------- watch
 
-async fn watch(args: &[String]) {
+async fn watch(args: &[String]) -> bool {
     let source = std::env::var("SPOOR_SOURCE").unwrap_or_else(|_| "broker".to_string());
     let once = has_flag(args, "--once");
     let dry_run =
@@ -803,10 +822,11 @@ async fn watch(args: &[String]) {
     let intent = Arc::new(Mutex::new(spoor_core::intent::IntentTracker::new(600)));
     let llm_state = state.clone();
     let llm_intent = intent.clone();
-    let llm_handle = tokio::spawn(async move {
-        run_llm_loop(&llm_state, dry_run, once, Some(llm_intent)).await;
-    });
-    match source.as_str() {
+    let llm_handle =
+        tokio::spawn(
+            async move { run_llm_loop(&llm_state, dry_run, once, Some(llm_intent)).await },
+        );
+    let completed = match source.as_str() {
         "artex-api" => run_artex_loop(&data, &state, dry_run, once, replay, dedupe),
         "both" => {
             let data_clone = data.clone();
@@ -820,9 +840,9 @@ async fn watch(args: &[String]) {
                     once,
                     replay,
                     dedupe_clone,
-                );
+                )
             });
-            run_broker_loop(
+            let broker_completed = run_broker_loop(
                 &data,
                 &state,
                 dry_run,
@@ -832,7 +852,8 @@ async fn watch(args: &[String]) {
                 Some(intent.clone()),
             )
             .await;
-            let _ = handle.join();
+            let artex_completed = handle.join().unwrap_or(false);
+            broker_completed && artex_completed
         }
         _ => {
             run_broker_loop(
@@ -846,8 +867,9 @@ async fn watch(args: &[String]) {
             )
             .await
         }
-    }
-    let _ = llm_handle.await;
+    };
+    let llm_completed = llm_handle.await.unwrap_or(false);
+    completed && llm_completed
 }
 
 async fn run_proxy(args: &[String]) {
@@ -932,7 +954,7 @@ async fn serve(args: &[String]) {
             eprintln!("[spoor-proxy] {}", err);
         }
     });
-    watch(args).await;
+    let _ = watch(args).await;
     let _ = handle.await;
 }
 
@@ -941,7 +963,7 @@ async fn run_llm_loop(
     dry_run: bool,
     once: bool,
     intent: Option<Arc<Mutex<spoor_core::intent::IntentTracker>>>,
-) {
+) -> bool {
     let events = state.join("llm-events.jsonl");
     let state_path = state.join("spoor.llm-state.json");
     let preview = state.join("ingest-preview.rust.jsonl");
@@ -951,9 +973,10 @@ async fn run_llm_loop(
     let mut offset = read_watcher_state(&state_path).offset;
     let mut signature = read_watcher_state(&state_path).signature;
     loop {
+        let mut blocked = false;
         if !events.exists() {
             if once {
-                return;
+                return true;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
@@ -978,21 +1001,27 @@ async fn run_llm_loop(
                     if consumed > 0 {
                         let mut posted = 0u64;
                         let mut failed_count = 0u64;
-                        for line in chunk[..consumed].lines() {
+                        let mut advanced = 0;
+                        for line in chunk[..consumed].split_inclusive('\n') {
                             if line.trim().is_empty() {
+                                advanced += line.len();
                                 continue;
                             }
                             let event: LlmTurnEvent = match serde_json::from_str(line) {
                                 Ok(event) => event,
                                 Err(err) => {
-                                    append_jsonl(
+                                    if !append_durable_jsonl(
                                         &state.join("llm-malformed.rust.jsonl"),
                                         &json!({
                                             "raw_line": line,
                                             "error": err.to_string(),
                                             "source": events.display().to_string(),
                                         }),
-                                    );
+                                    ) {
+                                        blocked = true;
+                                        break;
+                                    }
+                                    advanced += line.len();
                                     continue;
                                 }
                             };
@@ -1025,12 +1054,17 @@ async fn run_llm_loop(
                                 None,
                             ) {
                                 Delivery::Sent => posted += 1,
-                                Delivery::Failed => failed_count += 1,
+                                Delivery::Queued => failed_count += 1,
                                 Delivery::Duplicate => {}
+                                Delivery::Blocked => {
+                                    blocked = true;
+                                    break;
+                                }
                             }
+                            advanced += line.len();
                         }
-                        offset += consumed as u64;
-                        if !once && !dry_run {
+                        offset += advanced as u64;
+                        if advanced > 0 && !once && !dry_run {
                             let mut watcher = read_watcher_state(&state_path);
                             watcher.offset = offset;
                             watcher.signature = signature.clone();
@@ -1042,8 +1076,11 @@ async fn run_llm_loop(
                 }
             }
         }
+        if blocked {
+            eprintln!("[spoor-rs] LLM trail checkpoint held at byte {}", offset);
+        }
         if once {
-            return;
+            return !blocked;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -1123,10 +1160,25 @@ fn file_signature(path: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn write_watcher_state(path: &Path, state: &WatcherState) {
+fn replace_state_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
+    let tmp = path.with_extension(format!("{}.tmp", call_id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let written = file.write_all(contents).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_watcher_state(path: &Path, state: &WatcherState) {
     let value = json!({
         "offset": state.offset,
         "posted": state.posted,
@@ -1135,7 +1187,9 @@ fn write_watcher_state(path: &Path, state: &WatcherState) {
         "signature": state.signature,
         "last_ingest_utc": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     });
-    let _ = fs::write(path, value.to_string());
+    if let Err(err) = replace_state_file(path, value.to_string().as_bytes()) {
+        eprintln!("[spoor-rs] watcher checkpoint write failed: {}", err);
+    }
 }
 
 fn replay_dead_letter(path: &Path, base: &str, key: Option<&str>) {
@@ -1158,10 +1212,13 @@ fn replay_dead_letter(path: &Path, base: &str, key: Option<&str>) {
             remaining.push(line.to_string());
         }
     }
-    if remaining.is_empty() {
-        let _ = fs::remove_file(path);
+    let retained = if remaining.is_empty() {
+        fs::remove_file(path)
     } else {
-        let _ = fs::write(path, remaining.join("\n") + "\n");
+        replace_state_file(path, (remaining.join("\n") + "\n").as_bytes())
+    };
+    if let Err(err) = retained {
+        eprintln!("[spoor-rs] retry queue update failed: {}", err);
     }
     eprintln!(
         "[spoor-rs] replayed {} dead-letter payload(s), {} still failing",
@@ -1174,7 +1231,8 @@ fn replay_dead_letter(path: &Path, base: &str, key: Option<&str>) {
 enum Delivery {
     Sent,
     Duplicate,
-    Failed,
+    Queued,
+    Blocked,
 }
 
 async fn run_broker_loop(
@@ -1185,7 +1243,7 @@ async fn run_broker_loop(
     replay: bool,
     dedupe: Option<Arc<Mutex<DedupeStore>>>,
     intent: Option<Arc<Mutex<spoor_core::intent::IntentTracker>>>,
-) {
+) -> bool {
     let events = data.join("broker-events.jsonl");
     let state_path = state_dir.join("spoor.rust-state.json");
     let preview = state_dir.join("ingest-preview.rust.jsonl");
@@ -1199,10 +1257,11 @@ async fn run_broker_loop(
     };
     let mut signature = state.signature.clone();
     loop {
+        let mut blocked = false;
         if !events.exists() {
             if once {
                 eprintln!("[spoor-rs] no broker events yet: {}", events.display());
-                return;
+                return true;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
@@ -1238,21 +1297,26 @@ async fn run_broker_loop(
                     };
                     if consumed > 0 {
                         let complete = &chunk[..consumed];
-                        for line in complete.lines() {
+                        'lines: for line in complete.split_inclusive('\n') {
                             if line.trim().is_empty() {
+                                advanced += line.len() as u64;
                                 continue;
                             }
                             let event: BrokerEvent = match serde_json::from_str(line) {
                                 Ok(event) => event,
                                 Err(_) => {
                                     bad += 1;
-                                    append_jsonl(
+                                    if !append_durable_jsonl(
                                         &state_dir.join("broker-malformed.rust.jsonl"),
                                         &json!({
                                             "raw_line": line,
                                             "source": events.display().to_string(),
                                         }),
-                                    );
+                                    ) {
+                                        blocked = true;
+                                        break;
+                                    }
+                                    advanced += line.len() as u64;
                                     continue;
                                 }
                             };
@@ -1323,13 +1387,17 @@ async fn run_broker_loop(
                                 ) {
                                     Delivery::Sent => handled += 1,
                                     Delivery::Duplicate => duplicate_count += 1,
-                                    Delivery::Failed => failed_count += 1,
+                                    Delivery::Queued => failed_count += 1,
+                                    Delivery::Blocked => {
+                                        blocked = true;
+                                        break 'lines;
+                                    }
                                 }
                             }
+                            advanced += line.len() as u64;
                         }
-                        state.offset += consumed as u64;
+                        state.offset += advanced;
                         state.signature = signature.clone();
-                        advanced = consumed as u64;
                     }
                     // Dry-run never persists committed state.
                     if !once && !dry_run && advanced > 0 {
@@ -1344,6 +1412,12 @@ async fn run_broker_loop(
         if bad > 0 {
             eprintln!("[spoor-rs] skipped {} malformed line(s)", bad);
         }
+        if blocked {
+            eprintln!(
+                "[spoor-rs] broker trail checkpoint held at byte {}",
+                state.offset
+            );
+        }
         if handled + duplicate_count + failed_count > 0 {
             println!(
                 "[spoor-rs] {} {} payload(s), duplicates {}, failed {}",
@@ -1354,7 +1428,7 @@ async fn run_broker_loop(
             );
         }
         if once {
-            return;
+            return !blocked;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1367,7 +1441,7 @@ fn run_artex_loop(
     once: bool,
     replay: bool,
     dedupe: Option<Arc<Mutex<DedupeStore>>>,
-) {
+) -> bool {
     let interval = std::env::var("ARTEX_POLL_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1377,7 +1451,7 @@ fn run_artex_loop(
         Ok(password) if !password.is_empty() => password,
         _ => {
             eprintln!("[spoor-rs] artex-api source needs ARTEX_PASSWORD");
-            return;
+            return false;
         }
     };
     let base = std::env::var("ARTEX_API_URL")
@@ -1399,7 +1473,8 @@ fn run_artex_loop(
         eprintln!("[spoor-rs] artex cursor reset for replay");
     }
     loop {
-        match poller.poll(!dry_run) {
+        let mut blocked = false;
+        match poller.fetch() {
             Ok(records) => {
                 let mut sent = 0usize;
                 let mut duplicate_count = 0usize;
@@ -1426,8 +1501,14 @@ fn run_artex_loop(
                     ) {
                         Delivery::Sent => sent += 1,
                         Delivery::Duplicate => duplicate_count += 1,
-                        Delivery::Failed => failed_count += 1,
+                        Delivery::Queued => failed_count += 1,
+                        Delivery::Blocked => {
+                            blocked = true;
+                            eprintln!("[spoor-rs] ARTEX cursor held before an unsaved event");
+                            break;
+                        }
                     }
+                    poller.acknowledge(&record, !dry_run);
                 }
                 println!(
                     "[spoor-rs] {} {} artex command(s), duplicates {}, failed {}",
@@ -1437,13 +1518,16 @@ fn run_artex_loop(
                     failed_count
                 );
             }
-            Err(err) => eprintln!(
-                "[spoor-rs] artex api error: {} (retrying in {}s)",
-                err, interval
-            ),
+            Err(err) => {
+                blocked = true;
+                eprintln!(
+                    "[spoor-rs] artex api error: {} (retrying in {}s)",
+                    err, interval
+                );
+            }
         }
         if once {
-            return;
+            return !blocked;
         }
         std::thread::sleep(Duration::from_secs(interval));
     }
@@ -1480,7 +1564,7 @@ fn deliver_ingest(
         return if append_jsonl(preview, &serde_json::to_value(payload).unwrap()) {
             Delivery::Sent
         } else {
-            Delivery::Failed
+            Delivery::Blocked
         };
     }
     if post_payload(base, payload, key) {
@@ -1488,9 +1572,10 @@ fn deliver_ingest(
             store.mark(source, &dedupe_key);
         }
         Delivery::Sent
+    } else if append_durable_jsonl(failed, &serde_json::to_value(payload).unwrap()) {
+        Delivery::Queued
     } else {
-        append_jsonl(failed, &serde_json::to_value(payload).unwrap());
-        Delivery::Failed
+        Delivery::Blocked
     }
 }
 

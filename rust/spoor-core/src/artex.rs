@@ -138,10 +138,21 @@ impl<T: ArtexTransport> ArtexCommandPoller<T> {
     }
 
     pub fn poll(&mut self, save: bool) -> Result<Vec<Value>, String> {
+        let records = self.fetch()?;
+        if let Some(last) = records.last() {
+            self.acknowledge(last, save);
+        }
+        Ok(records)
+    }
+
+    /// Fetch without moving the cursor. Delivery callers acknowledge records in order.
+    pub fn fetch(&mut self) -> Result<Vec<Value>, String> {
         let mut collected: Vec<Value> = Vec::new();
         let mut page = 0u32;
         while page < 10 {
-            let (records, total) = self.client.list_commands(page, self.page_size, self.task_id)?;
+            let (records, total) = self
+                .client
+                .list_commands(page, self.page_size, self.task_id)?;
             if records.is_empty() {
                 break;
             }
@@ -163,23 +174,29 @@ impl<T: ArtexTransport> ArtexCommandPoller<T> {
             page += 1;
         }
         collected.sort_by_key(id);
-        if collected.len() > 0 {
-            self.last_id = id(collected.last().unwrap());
+        Ok(collected)
+    }
+
+    pub fn acknowledge(&mut self, record: &Value, save: bool) {
+        let completed = id(record);
+        if completed > self.last_id {
+            self.last_id = completed;
             if save {
                 self.save_last_id();
             }
         }
-        Ok(collected)
     }
 
     fn save_last_id(&self) {
         if let Some(parent) = self.state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(
+        if let Err(err) = std::fs::write(
             &self.state_path,
             serde_json::json!({"last_command_id": self.last_id}).to_string(),
-        );
+        ) {
+            eprintln!("[spoor-rs] ARTEX cursor write failed: {}", err);
+        }
     }
 }
 
@@ -227,6 +244,8 @@ impl ArtexTransport for FakeTransport {
         self.calls.push(format!("{} {}", method, url));
         self.auth
             .push(headers.get("Authorization").cloned().unwrap_or_default());
-        self.responses.pop_front().unwrap_or((500, "{}".to_string()))
+        self.responses
+            .pop_front()
+            .unwrap_or((500, "{}".to_string()))
     }
 }
