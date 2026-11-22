@@ -587,7 +587,15 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
     let session = default_session();
     let command = format!("{} {}", tool, argv.join(" ")).trim().to_string();
     let framework_match = spoor_core::ioc::scan(&command);
-    let mut decision = state.engine.evaluate(&tool, &argv, Some(&state.approvals));
+    let mut decision = if body["require_strict_audit"] == true && !state.strict_audit {
+        Decision::new(
+            "deny",
+            "strict-audit-required",
+            "the worker launcher requires a broker with strict audit enabled",
+        )
+    } else {
+        state.engine.evaluate(&tool, &argv, Some(&state.approvals))
+    };
     let taint_info = {
         let mut taint = state.taint.lock().unwrap();
         let (next, info) = state
@@ -636,6 +644,7 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
         "decision": decision.decision,
         "rule_id": decision.rule_id,
         "reason": decision.reason,
+        "strict_audit": state.strict_audit,
     });
     if let Some(path) = &decision.approval_file {
         response["approval_file"] = json!(path);

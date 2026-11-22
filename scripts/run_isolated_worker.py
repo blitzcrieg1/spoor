@@ -3,18 +3,16 @@
 import argparse
 import json
 import os
-from pathlib import Path, PurePosixPath
-import re
+from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
+import sys
+
+from worker_approval import WorkerRequest, consume_approval, issue_approval
 
 
-def run_worker(shim, image, executable, arguments):
-    if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
-        raise ValueError("Use the full ID of a locally available Linux image.")
-    if not PurePosixPath(executable).is_absolute() or executable == "/":
-        raise ValueError("Use an absolute executable path inside the image.")
-
+def run_worker(shim, request, state_dir, token):
     docker = shutil.which("docker")
     if docker is None:
         raise ValueError("Docker CLI is required.")
@@ -40,38 +38,47 @@ def run_worker(shim, image, executable, arguments):
         raise ValueError("Docker must have a seccomp profile enabled.")
 
     image_info = subprocess.run(
-        [docker, "image", "inspect", "--format", "{{json .}}", image],
+        [docker, "image", "inspect", "--format", "{{json .}}", request.image],
         check=True, capture_output=True, text=True, timeout=15,
     )
     metadata = json.loads(image_info.stdout)
-    if metadata["Id"] != image or metadata["Os"] != "linux":
+    if metadata["Id"] != request.image or metadata["Os"] != "linux":
         raise ValueError("The worker image must be a local Linux image with the requested ID.")
     if metadata["Config"].get("Volumes"):
         raise ValueError("Worker images must not declare Docker volumes.")
 
+    if not consume_approval(state_dir, request, token):
+        raise ValueError("Approval is missing, expired, used, or bound to a different request.")
+
     return subprocess.run([
         os.fspath(shim), docker, "run", "--rm", "--pull=never",
-        "--network=none", "--read-only", "--user=65532:65532", "--cap-drop=ALL",
-        "--security-opt=no-new-privileges=true", "--ipc=none", "--no-healthcheck",
-        "--log-driver=none", "--pids-limit=64", "--cpus=1",
-        "--memory=128m", "--memory-swap=128m",
-        "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777", "--workdir=/tmp",
-        "--entrypoint", executable, image, *arguments,
-    ]).returncode
+        *request.isolation_profile, "--entrypoint", request.executable, request.image,
+        *request.arguments,
+    ], stdin=subprocess.DEVNULL, env=dict(os.environ, SPOOR_REQUIRE_STRICT_AUDIT="1")).returncode
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shim", required=True, type=Path, help="Path to the built spoor-shim binary")
-    parser.add_argument("image", help="Full Docker image ID beginning with sha256:")
-    parser.add_argument("executable", help="Absolute path inside the image")
-    parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    commands = parser.add_subparsers(dest="command", required=True)
+    approve = commands.add_parser("approve", help="Create a five-minute, single-use approval")
+    run = commands.add_parser("run", help="Read an approval from standard input and start the worker")
+    run.add_argument("--shim", required=True, type=Path, help="Path to the built spoor-shim binary")
+    for command in (approve, run):
+        command.add_argument("--state-dir", required=True, type=Path, help="Private approval directory")
+        command.add_argument("image", help="Full Docker image ID beginning with sha256:")
+        command.add_argument("executable", help="Absolute path inside the image")
+        command.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
-        return run_worker(args.shim, args.image, args.executable, args.arguments)
+        request = WorkerRequest.from_cli(args.image, args.executable, args.arguments)
+        if args.command == "approve":
+            print(issue_approval(args.state_dir, request))
+            return 0
+        token = sys.stdin.readline(64).removesuffix("\n")
+        return run_worker(args.shim, request, args.state_dir, token)
     except subprocess.CalledProcessError as error:
         parser.exit(1, f"spoor worker: Docker preflight failed: {error.stderr.strip()}\n")
-    except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+    except (ValueError, OSError, sqlite3.Error, subprocess.TimeoutExpired) as error:
         parser.exit(1, f"spoor worker: {error}\n")
 
 

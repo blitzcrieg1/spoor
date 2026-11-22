@@ -36,6 +36,12 @@ subprocess.run([sys.executable, "-c", sys.argv[1], sys.argv[2]], check=True)
 """
 
 
+def launch(command, token, env):
+    return subprocess.run(
+        command, input=token, env=env, capture_output=True, text=True, timeout=45,
+    )
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("Usage: python scripts/check_isolated_worker.py <local-linux-image-id>")
@@ -45,18 +51,30 @@ def main():
     with tempfile.TemporaryDirectory() as folder:
         directory = Path(folder)
         with tempfile.NamedTemporaryFile(prefix="spoor-host-only-", dir="/tmp") as host_file:
-            command = [
-                sys.executable, ROOT / "scripts" / "run_isolated_worker.py",
-                "--shim", shim, image, "/usr/local/bin/python", "-c", PARENT,
+            launcher = [sys.executable, ROOT / "scripts" / "run_isolated_worker.py"]
+            options = ["--state-dir", directory / "worker-approvals"]
+            request = [
+                image, "/usr/local/bin/python", "-c", PARENT,
                 PROBE, Path(host_file.name).name,
             ]
+            approve = launcher + ["approve", *options, *request]
+            command = launcher + ["run", "--shim", shim, *options, *request]
+            token = subprocess.check_output(approve, text=True, timeout=10)
             with running_broker(spoor, directory, env) as broker_env:
-                result = subprocess.run(command, env=broker_env, capture_output=True, text=True, timeout=45)
+                changed = launch(command + ["extra-argument"], token, broker_env)
+                require(changed.returncode == 1 and "different request" in changed.stderr
+                        and not changed.stdout, "The changed worker request should be refused.")
+                result = launch(command, token, broker_env)
+                repeated = launch(command, token, broker_env)
             require(result.returncode == 0, f"Isolated worker failed. {result.stderr}")
             require(result.stdout.strip() == "worker-isolated", "The worker probe did not complete.")
             require(not result.stderr, f"The shim or runtime reported an error. {result.stderr}")
+            require(repeated.returncode == 1 and "used" in repeated.stderr
+                    and not repeated.stdout, "Replaying an approval should be refused.")
 
-        events = [json.loads(line) for line in (directory / TRAIL).read_text(encoding="utf-8").splitlines()]
+        trail = (directory / TRAIL).read_text(encoding="utf-8")
+        require(token.strip() not in trail, "The trail exposed the approval token.")
+        events = [json.loads(line) for line in trail.splitlines()]
         require(len(events) == 2, "Expected one decision and one completion.")
         decision, completion = events
         require(
@@ -71,12 +89,22 @@ def main():
         blocked.mkdir()
         (blocked / TRAIL).mkdir()
         with running_broker(spoor, blocked, env) as broker_env:
-            result = subprocess.run(command, env=broker_env, capture_output=True, text=True, timeout=45)
+            result = launch(command, subprocess.check_output(approve, text=True, timeout=10),
+                            broker_env)
         require(
             result.returncode == 126 and not result.stdout and "audit-unavailable" in result.stderr,
             f"Strict audit should stop the worker before execution. {result.stderr}",
         )
-    print("Worker and child process isolation, matched audit records, and strict audit refusal passed.")
+        nonstrict = directory / "nonstrict"
+        nonstrict.mkdir()
+        with running_broker(spoor, nonstrict, env, strict=False) as broker_env:
+            result = launch(command, subprocess.check_output(approve, text=True, timeout=10),
+                            broker_env)
+        require(
+            result.returncode == 126 and not result.stdout and "strict-audit-required" in result.stderr,
+            f"The worker must require strict audit. {result.stderr}",
+        )
+    print("Worker isolation, one-time approval, matched audit records, and strict audit refusal passed.")
 
 
 if __name__ == "__main__":

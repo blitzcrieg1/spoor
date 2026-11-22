@@ -31,14 +31,19 @@ fn main() {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "lab-session".to_string());
     let task = std::env::var("ARTEX_TASK_ID").unwrap_or_default();
+    let require_strict_audit =
+        std::env::var("SPOOR_REQUIRE_STRICT_AUDIT").ok().as_deref() == Some("1");
     let parent_command_line = capture_parent_command_line();
-    let payload = build_payload(
+    let mut payload = build_payload(
         &tool,
         &argv,
         &session,
         &task,
         parent_command_line.as_deref(),
     );
+    if require_strict_audit {
+        payload["require_strict_audit"] = json!(true);
+    }
 
     let (status, body) = match post_json(
         &format!("{}/decide", broker.trim_end_matches('/')),
@@ -54,13 +59,18 @@ fn main() {
         eprintln!("[spoor-shim] broker returned {} - refusing to run", status);
         std::process::exit(126);
     }
-    let (decision, call_id) = parse_decision(&body).unwrap_or(("deny".to_string(), String::new()));
+    let (decision, call_id, strict_audit) =
+        parse_decision(&body).unwrap_or(("deny".to_string(), String::new(), false));
     if decision != "allow" {
         eprintln!("[spoor-shim] {}: {}", decision, body);
         std::process::exit(126);
     }
     if call_id.is_empty() {
         eprintln!("[spoor-shim] broker allowed the call without a call ID");
+        std::process::exit(126);
+    }
+    if require_strict_audit && !strict_audit {
+        eprintln!("[spoor-shim] broker did not confirm strict audit");
         std::process::exit(126);
     }
 
@@ -321,11 +331,11 @@ fn redact_url_userinfo(value: &str) -> String {
     )
 }
 
-fn parse_decision(body: &str) -> Option<(String, String)> {
+fn parse_decision(body: &str) -> Option<(String, String, bool)> {
     let value: Value = serde_json::from_str(body).ok()?;
     let decision = value["decision"].as_str()?.to_string();
     let call_id = value["call_id"].as_str().unwrap_or("").to_string();
-    Some((decision, call_id))
+    Some((decision, call_id, value["strict_audit"] == true))
 }
 
 fn resolve_tool(tool: &str, skip: Option<&Path>) -> Option<PathBuf> {
@@ -501,7 +511,11 @@ mod tests {
     fn decision_parsing() {
         assert_eq!(
             parse_decision(r#"{"decision":"allow","call_id":"abc"}"#),
-            Some(("allow".to_string(), "abc".to_string()))
+            Some(("allow".to_string(), "abc".to_string(), false))
+        );
+        assert_eq!(
+            parse_decision(r#"{"decision":"allow","call_id":"abc","strict_audit":true}"#),
+            Some(("allow".to_string(), "abc".to_string(), true))
         );
         assert_eq!(
             parse_decision(r#"{"decision":"deny","call_id":"d1"}"#).map(|pair| pair.0),
