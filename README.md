@@ -93,9 +93,9 @@ commands, so review it for your environment. Parent command capture is optional
 and redaction is best effort. Treat audit trails as sensitive and restrict
 access to them. Detection matches are triage leads.
 
-## Attribution
+## License and attribution
 
-Selected detection rules were adapted from ThreatDefence. The repository keeps
-the [MIT notice](detections/LICENSE-THREATDEFENCE) for that material. An overall
-license for the original Spoor code has yet to be chosen.
+Spoor's original code is licensed under the [Apache License 2.0](LICENSE).
+Selected detection rules were adapted from ThreatDefence and retain the
+[ThreatDefence MIT notice](detections/LICENSE-THREATDEFENCE).
 [ThreatDefence reference snapshot](https://github.com/ThreatDefence/agentic-attack-detections/tree/7a29e1683b0b2100baf4b1986870c12e7ffe4a2a)
