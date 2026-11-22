@@ -191,6 +191,41 @@ Audit trails can contain command arguments and model prompt content. Parent
 command redaction covers common credential patterns. For audit data handling
 and private vulnerability reporting, see the [security policy](SECURITY.md).
 
+## Isolated Linux worker pilot
+
+A trusted operator can run one offline worker through the host-side Spoor
+shim. The Docker daemon, broker, and audit trail stay outside the worker.
+Use a dedicated lab host or VM and an approved Linux image. Keep the launcher
+and access to the Docker daemon with the operator.
+
+The worker runs as UID and GID 65532 with a read-only root filesystem, a
+16 MiB writable `/tmp`, and loopback-only networking. The launcher drops
+capabilities, disallows privilege gains, and requires Docker seccomp and
+resource limits. It accepts a locally available image by its full ID,
+rejects images that declare volumes, and supplies no host bind mounts.
+
+Build the workspace and start the host broker in strict audit mode.
+
+```sh
+cargo build --locked --manifest-path rust/Cargo.toml --workspace
+SPOOR_STRICT_AUDIT=1 rust/target/debug/spoor broker --policy rust/policy.json
+```
+
+From a second terminal on the host, run a harmless command using the image
+you reviewed. The shim records the decision for the launch and the worker's
+exit status with the same call ID.
+
+```sh
+docker pull python:3.12-alpine
+worker_image="$(docker image inspect --format '{{.Id}}' python:3.12-alpine)"
+python scripts/run_isolated_worker.py --shim rust/target/debug/spoor-shim \
+  "$worker_image" /usr/local/bin/python -c 'print("hello from the worker")'
+```
+
+The Linux CI probe checks the restrictions in a child process and confirms
+the broker records both events. Spoor audits the container launch and its
+exit. Activity inside the container stays subject to Docker's isolation.
+
 ## License and attribution
 
 Spoor's original code is licensed under the [Apache License 2.0](LICENSE).
