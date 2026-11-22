@@ -4,10 +4,8 @@ Spoor is experimental. Please include the commit you reviewed in any report.
 
 ## Report a vulnerability privately
 
-While the repository is private, contact the maintainers through the private
-channel you used to get access. Once Spoor is public and GitHub's private
-vulnerability reporting is enabled, use **Security and quality → Advisories →
-Report a vulnerability**.
+Use **Security and quality → Advisories → Report a vulnerability** on GitHub
+to send a private report to the maintainers.
 
 Include the affected commit, the setup needed to observe the issue, and the
 potential impact. Use synthetic data and redact credentials, customer data,

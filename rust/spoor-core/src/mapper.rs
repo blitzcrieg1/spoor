@@ -223,7 +223,7 @@ pub fn map_artex_command(rec: &Value) -> IngestPayload {
     }
 }
 
-/// Map one LLM turn to the Agentmetry canonical schema (event_type `llm_turn`).
+/// Build the external ingest payload for a Spoor model turn.
 pub fn map_llm_event(ev: &LlmTurnEvent) -> IngestPayload {
     let summary = if !ev.tool_calls.is_empty() {
         let names: Vec<&str> = ev
@@ -278,7 +278,7 @@ mod llm_tests {
     use crate::model::{LlmUsage, ToolCallProposal};
 
     #[test]
-    fn maps_llm_turn_to_canonical_event() {
+    fn maps_llm_turn_to_ingest_payload() {
         let event = LlmTurnEvent {
             timestamp: "2026-11-21T23:25:00.000Z".to_string(),
             task_id: "artex-task-1".to_string(),

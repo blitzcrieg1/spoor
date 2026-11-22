@@ -108,7 +108,8 @@ def check_pairs(directory, received, session):
                 == [("tool_authorized", "pending"), (expected_event, expected_outcome)]
                 and "exit_code" not in rows[0]["tool"]["arguments"]
                 and rows[1]["tool"]["arguments"]["exit_code"] == report["exit_code"]
-                and all(row["session_id"] == session and row["correlation_id"] == session
+                and all(row["adapter"] == "spoor"
+                        and row["session_id"] == session and row["correlation_id"] == session
                         and row["tool"]["arguments"]["command"] == decision["command"]
                         and row["tool"]["arguments"].get("parent_command_line") == parent
                         for row in rows),

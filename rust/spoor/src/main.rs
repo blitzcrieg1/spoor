@@ -1722,7 +1722,23 @@ mod tests {
 }
 
 fn post_payload(base: &str, payload: &IngestPayload, api_key: Option<&str>) -> bool {
-    let body = serde_json::to_string(payload).unwrap_or_default();
+    #[derive(serde::Serialize)]
+    struct AgentmetryRequest<'a> {
+        adapter: &'static str,
+        #[serde(flatten)]
+        event: &'a IngestPayload,
+    }
+
+    let body = match serde_json::to_string(&AgentmetryRequest {
+        adapter: "spoor",
+        event: payload,
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            eprintln!("[spoor-rs] could not serialize ingest payload: {}", err);
+            return false;
+        }
+    };
     let url = format!("{}/api/v1/audit/ingest", base.trim_end_matches('/'));
     for attempt in 0..3u32 {
         match http_post(&url, &body, api_key) {

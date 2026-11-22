@@ -16,6 +16,7 @@ Spoor gives defenders a small, reproducible way to study the tool-call evidence
 an instrumented agent can leave. [Microsoft Threat Intelligence](https://www.microsoft.com/en-us/security/blog/2026/11/06/artex-abuse-expands-as-cybercriminals-target-financial-sector/) · [FBI advisory](https://www.ic3.gov/CSA/2026/261113.pdf)
 
 [Try a synthetic trace](#try-a-synthetic-trace) ·
+[Forward to Agentmetry](#forward-to-agentmetry) ·
 [Explore the detections](#detection-rules) ·
 [See what has been verified](#verification)
 
@@ -74,6 +75,35 @@ related calls.
 | `authorization` | `tool_denied` or `approval_request` | Policy blocked the request or required approval. |
 | `completion` | `tool_called` or `tool_failed` | The shim reported exit code 0 or a nonzero exit code in `tool.arguments.exit_code`. |
 
+## Forward to Agentmetry
+
+Spoor's watcher sends broker events to the
+[Agentmetry external ingest API](https://github.com/blitzcrieg1/agentmetry/blob/v0.13.0/docs/agentmetry-external-ingest.md).
+Run Agentmetry with external ingest and audit export enabled. Spoor's
+`AGENTMETRY_URL` defaults to `http://127.0.0.1:8000`. Keep this HTTP connection
+on loopback in the lab. If Agentmetry requires authentication, set
+`AGENTMETRY_API_KEY` securely in the watcher's environment. An Agentmetry
+ingest-only token works for forwarding.
+
+Run the watcher with the same `BROKER_DATA_DIR` as the broker. Remove
+`--once` to keep it running.
+
+```sh
+cargo run --locked --manifest-path rust/Cargo.toml -p spoor -- watch --once --policy rust/policy.json
+```
+
+Agentmetry v0.13.0 stores new Spoor requests with `source.adapter=spoor`.
+It records the ARTEX attribution as `source.claimed_app=artex` and uses
+`source.app=unknown` for unlisted sources. Use the adapter field to find
+Spoor events and the claimed app as context. For execution counts, filter on
+`tool.arguments.phase=completion`. Agentmetry v0.13.0 maps both phases of an
+allowed call to `action.type=tool_called`. The `source_topic` field keeps the
+original event name.
+
+The broker event pair is the verified integration. The optional model proxy
+produces an `llm_turn` payload that Agentmetry v0.13.0 handles as a generic tool
+event. Look for the full model-turn record in Spoor's local trail.
+
 ## Detection rules
 
 - [Sigma](detections/sigma) covers brokered completion reports with ARTEX or
@@ -104,11 +134,10 @@ the event and your environment's baseline.
 checkout, runs the Rust tests and this quick start, and checks the Sigma
 process fixtures on Linux and Windows.
 
-The live loopback check read four stored events back from Agentmetry. Two
-distinct call IDs shared one session and each linked the authorization
-to its exit code and outcome. The tested instance normalizes both phases to
-`action.type=tool_called`. Query by `tool.arguments.phase` to distinguish
-them. The source topic retains the original Spoor event name.
+An authenticated loopback check against Agentmetry v0.13.0 read four stored
+events back from its audit API. Two distinct call IDs shared one session and
+each linked its authorization to its exit code and outcome. Spoor also
+exported both decisions from Agentmetry's saved trail to TraceSig.
 
 Earlier broker trails with call IDs can be read through the updated watcher.
 Consumers that used `tool_called` as a policy decision should use the
