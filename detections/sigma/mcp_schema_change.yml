@@ -1,0 +1,23 @@
+title: MCP server tool listing changed (rug-pull / tool shadowing)
+id: 4a7c1e9b-3d5f-4a2e-b8c6-9e1f3a5b7d29
+status: experimental
+description: >
+  An MCP server's `tools/list` fingerprint changed between calls. Agentmetry
+  emits this as `action.type: mcp_schema` with `mcp_schema.status: changed`
+  (schema v1.2.0). A changed listing can hide a poisoned tool description.
+author: agentic lab
+date: 2026/11/21
+logsource:
+  product: agentmetry
+  service: audit
+detection:
+  selection:
+    action.type: mcp_schema
+    mcp_schema.status: changed
+  condition: selection
+falsepositives:
+  - Legitimate MCP server upgrades (rebaseline after review)
+level: high
+tags:
+  - attack.defense_evasion
+  - atlas.AML.T0109

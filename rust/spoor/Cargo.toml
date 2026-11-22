@@ -1,0 +1,14 @@
+[package]
+name = "spoor"
+version = "0.1.0"
+edition = "2021"
+description = "Spoor bridge binary: broker, trail watcher, TraceSig export, replay gate"
+
+[dependencies]
+spoor-core = { path = "../spoor-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "fs", "io-util", "signal", "process"] }
+axum = "0.8"
+chrono = "0.4"
+futures-core = "0.3"

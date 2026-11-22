@@ -1,0 +1,32 @@
+# TraceSig rules for the lab — Sigma-style YAML over agent tool-call traces.
+# Docs: https://github.com/howardhsieh/tracesig
+# Scan: tracesig scan data/tracesig-trace.jsonl --rules detections/tracesig
+#
+# These complement the Sigma rules in detections/sigma (host logs) and the
+# Suricata rules (network): TraceSig sees the agent's *call sequence*.
+id: TS-LAB-001
+title: Agent targets a host outside the Juice Shop allow-list
+severity: critical
+category: discovery
+detection:
+  selection:
+    tool|matches: "(nmap|curl|sqlmap|nikto|hydra|ffuf|gobuster|masscan)"
+    args|matches: "(192\\.168\\.|10\\.\\d+\\.\\d+\\.\\d+|172\\.(1[6-9]|2\\d|3[01])\\.|http://(?!host\\.docker\\.internal|juice-shop|127\\.0\\.0\\.1|localhost))"
+---
+id: TS-LAB-002
+title: Secret read followed by a network egress tool
+severity: critical
+category: exfiltration
+detection:
+  taint:
+    source_label: secret
+    sink|matches: "(curl|wget|nc|ssh|scp)"
+---
+id: TS-LAB-003
+title: Untrusted target content followed by an upload sink
+severity: high
+category: exfiltration
+detection:
+  taint:
+    source_label: untrusted
+    sink|matches: "(curl.*(-T\\s|--upload-file|--data|-d\\s)|wget.*--post|nc\\s)"

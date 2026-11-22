@@ -1,0 +1,36 @@
+title: ARTEX agent scope drift — tool call targets a host outside the allow-list
+id: 7a1f6c22-2f6b-4c51-9a1e-0b8e3f6d2c10
+status: experimental
+description: >
+  Mirrors the lab broker's scope policy at the host-log layer: an agent tool
+  (nmap/curl/sqlmap/...) aimed at anything except the Juice Shop allow-list
+  (host.docker.internal, juice-shop, 127.0.0.1, localhost on port 3000).
+  Useful when the broker is bypassed or not yet wired.
+author: agentic lab
+date: 2026/11/21
+references:
+  - https://github.com/jiwoochris/artex-global
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_tools:
+    CommandLine|contains:
+      - 'nmap'
+      - 'curl'
+      - 'sqlmap'
+      - 'nikto'
+      - 'masscan'
+      - 'ffuf'
+      - 'gobuster'
+      - 'hydra'
+  selection_out_of_scope:
+    CommandLine|re: '(?i)(nmap|curl|sqlmap|nikto|masscan|ffuf|gobuster|hydra)[^|]*\b(192\.168\.(?!0\.104\b)\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b'
+  condition: selection_tools and selection_out_of_scope
+falsepositives:
+  - Administrator intentionally testing the scope policy
+level: high
+tags:
+  - attack.discovery
+  - attack.t1046
+  - atlas.AML.T0043

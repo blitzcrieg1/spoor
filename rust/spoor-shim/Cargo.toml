@@ -1,0 +1,9 @@
+[package]
+name = "spoor-shim"
+version = "0.1.0"
+edition = "2021"
+description = "Spoor shim: broker decision -> run real tool -> report (in-container mediation)"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"

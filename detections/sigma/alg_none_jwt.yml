@@ -1,0 +1,22 @@
+title: Unsigned JWT (alg none) in Request
+id: 9e1c4d77-2a5b-4f3c-b6d8-0c7e1f2a3b33
+status: experimental
+description: A JWT with the alg none header in the URI or Authorization header.
+references:
+  - https://github.com/ThreatDefence/agentic-attack-detections/blob/7a29e1683b0b2100baf4b1986870c12e7ffe4a2a/frameworks/artex/sigma/web/web_jwt_alg_none_probe.yml
+author: ThreatDefence (adapted for the Spoor lab)
+date: 2026-11-22
+tags:
+  - attack.credential-access
+  - attack.t1550
+logsource:
+  category: webserver
+detection:
+  selection_uri:
+    cs-uri-query|contains: 'eyJhbGciOiJub25lIn0.'
+  selection_header:
+    cs-headers|contains: 'eyJhbGciOiJub25lIn0.'
+  condition: 1 of selection_*
+falsepositives:
+  - Test suites exercising alg:none rejection
+level: medium

@@ -1,0 +1,28 @@
+title: ARTEX Probe Markers in HTTP Request
+id: 7c9e2a54-3b1d-4c8e-8f2a-5d6b0e9c1a22
+status: experimental
+description: X-ARTX-KEY header or ARTEX probe marker strings in a request.
+references:
+  - https://github.com/ThreatDefence/agentic-attack-detections/blob/7a29e1683b0b2100baf4b1986870c12e7ffe4a2a/frameworks/artex/sigma/web/web_artex_probe_header.yml
+author: ThreatDefence (adapted for the Spoor lab)
+date: 2026-11-22
+tags:
+  - attack.reconnaissance
+  - attack.t1190
+logsource:
+  category: webserver
+detection:
+  selection_marker:
+    cs-uri-query|contains:
+      - 'ARTEX_WRITE_PROBE'
+      - 'ARTX_PERSIST_OK'
+      - 'artex_control_marker_zz9q'
+      - 'ARTEX-PROBE-'
+      - 'artex-probe-'
+      - 'zzz-nonexistent-xyz123'
+  selection_header:
+    cs-headers|contains: 'X-ARTX-KEY'
+  condition: 1 of selection_*
+falsepositives:
+  - Authorized ARTEX testing
+level: high

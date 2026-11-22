@@ -1,0 +1,189 @@
+{
+    "scope":  {
+                  "allow_hosts":  [
+                                      "host.docker.internal",
+                                      "juice-shop",
+                                      "127.0.0.1",
+                                      "localhost"
+                                  ],
+                  "allow_ports":  [
+                                      3000
+                                  ],
+                  "note":  "The only authorized target is the Juice Shop lab app on port 3000. Anything else is scope drift."
+              },
+    "dlp_deny":  [
+                     {
+                         "id":  "cred-read-ssh",
+                         "patterns":  [
+                                          "\\.ssh[/\\\\]",
+                                          "id_rsa",
+                                          "id_ed25519"
+                                      ],
+                         "reason":  "credential file access"
+                     },
+                     {
+                         "id":  "cred-read-cloud",
+                         "patterns":  [
+                                          "\\.aws[/\\\\]credentials",
+                                          "\\.gcloud",
+                                          "\\.kube[/\\\\]config",
+                                          "aws_secret",
+                                          "github_token"
+                                      ],
+                         "reason":  "cloud credential access"
+                     },
+                     {
+                         "id":  "cred-read-env",
+                         "patterns":  [
+                                          "(^|\\s)(cat|less|more|head|tail)\\s+\\.env",
+                                          "printenv.*KEY",
+                                          "env\\s*\\|"
+                                      ],
+                         "reason":  "environment/secret enumeration"
+                     },
+                     {
+                         "id":  "destructive",
+                         "patterns":  [
+                                          "rm\\s+-rf\\s+/",
+                                          "mkfs",
+                                          "dd\\s+if=/dev",
+                                          "shutdown",
+                                          "reboot",
+                                          "\\.\\.\\.\\s*\\(\\s*\\)",
+                                          "chmod\\s+777\\s+/"
+                                      ],
+                         "reason":  "destructive action"
+                     },
+                     {
+                         "id":  "db-destructive",
+                         "patterns":  [
+                                          "drop\\s+table",
+                                          "delete\\s+from\\s+users\\s*;"
+                                      ],
+                         "reason":  "destructive database statement"
+                     }
+                 ],
+    "approval":  [
+                     {
+                         "id":  "exploit-sqlmap",
+                         "patterns":  [
+                                          "(^|[\\s;\"\u0027])sqlmap(\\s|$)"
+                                      ],
+                         "reason":  "sqlmap requires explicit approval"
+                     },
+                     {
+                         "id":  "exploit-hydra",
+                         "patterns":  [
+                                          "(^|[\\s;\"\u0027])hydra(\\s|$)"
+                                      ],
+                         "reason":  "hydra requires explicit approval"
+                     },
+                     {
+                         "id":  "exploit-msf",
+                         "patterns":  [
+                                          "msfconsole",
+                                          "metasploit"
+                                      ],
+                         "reason":  "metasploit requires explicit approval"
+                     },
+                     {
+                         "id":  "exploit-nikto",
+                         "patterns":  [
+                                          "(^|[\\s;\"\u0027])nikto(\\s|$)"
+                                      ],
+                         "reason":  "nikto requires explicit approval"
+                     }
+                 ],
+    "approval_ttl_seconds":  900,
+    "taint":  {
+                  "enabled":  true,
+                  "mode":  "ask",
+                  "note":  "Session-level provenance approximation of APG\u0027s taint tracking. flag = annotate only; ask/deny = gate a sink that follows a tainted read.",
+                  "source_rules":  [
+                                       {
+                                           "id":  "target-http-read",
+                                           "labels":  [
+                                                          "untrusted",
+                                                          "web"
+                                                      ],
+                                           "patterns":  [
+                                                            "curl\\s+(?!--data|--form|-d\\b|-T\\s|--upload-file|-X\\s*POST)[^|\u0026;]*(https?://(host\\.docker\\.internal|juice-shop|127\\.0\\.0\\.1|localhost):3000)"
+                                                        ]
+                                       },
+                                       {
+                                           "id":  "target-wget-read",
+                                           "labels":  [
+                                                          "untrusted",
+                                                          "web"
+                                                      ],
+                                           "patterns":  [
+                                                            "wget\\s+[^|\u0026;]*(https?://(host\\.docker\\.internal|juice-shop|127\\.0\\.0\\.1|localhost):3000)"
+                                                        ]
+                                       },
+                                       {
+                                           "id":  "scanner-read",
+                                           "labels":  [
+                                                          "untrusted",
+                                                          "web"
+                                                      ],
+                                           "patterns":  [
+                                                            "(^|[\\s;\"\u0027])(nmap|nikto|sqlmap)\\s"
+                                                        ]
+                                       },
+                                       {
+                                           "id":  "secret-read",
+                                           "labels":  [
+                                                          "secret"
+                                                      ],
+                                           "patterns":  [
+                                                            "\\.ssh|id_rsa|id_ed25519|\\.aws|credentials|\\.env"
+                                                        ]
+                                       }
+                                   ],
+                  "sink_rules":  [
+                                     {
+                                         "id":  "upload-sink",
+                                         "labels":  [
+                                                        "egress"
+                                                    ],
+                                         "patterns":  [
+                                                          "curl\\s+[^|\u0026;]*(--data|-d\\s|-X\\s*POST|--upload-file|-T\\s|[^|\u0026;]*--form)",
+                                                          "wget\\s+[^|\u0026;]*(--post-data|--post-file)"
+                                                      ]
+                                     },
+                                     {
+                                         "id":  "network-sink",
+                                         "labels":  [
+                                                        "egress"
+                                                    ],
+                                         "patterns":  [
+                                                          "(^|[\\s;\"\u0027])(nc|scp|sftp|ssh)\\s"
+                                                      ]
+                                     }
+                                 ],
+                  "reason":  "tainted target content flows to an egress sink (possible exfiltration)"
+              },
+    "context_taint":  {
+                          "enabled":  true,
+                          "mode":  "ask",
+                          "ttl_seconds":  1800,
+                          "patterns":  [
+                                           "rm\\s+-rf\\s+/",
+                                           "mkfs",
+                                           "dd\\s+if=/dev",
+                                           "shutdown|reboot",
+                                           "cat\\s+/etc/shadow",
+                                           "\\.ssh|id_rsa|id_ed25519",
+                                           "chmod\\s+777\\s+/",
+                                           "drop\\s+table",
+                                           "curl\\s+[^|\u0026;]*(-d\\s|--data|-T\\s|--upload-file|--form)",
+                                           "wget\\s+[^|\u0026;]*(--post-data|--post-file)",
+                                           "(^|[\\s;\"\u0027])(nc|ssh|scp|sftp)\\s"
+                                       ],
+                          "reason":  "untrusted external content in model context; this command needs approval",
+                          "labels":  [
+                                         "untrusted",
+                                         "external"
+                                     ]
+                      }
+}
