@@ -232,8 +232,9 @@ printf '%s\n' "$approval" | python scripts/run_isolated_worker.py run \
 The launcher requires a broker that confirms strict audit. The shim records
 the launch and the worker's exit status with the same call ID. The Linux CI
 probe checks the restrictions in a child process, approval consumption, and
-both audit events. Activity inside the container stays subject to Docker's
-isolation.
+both audit events. It forwards the successful launch and exit to Agentmetry
+v0.13.0 and reads them back by call ID. Activity inside the container stays
+subject to Docker's isolation.
 
 ## License and attribution
 
