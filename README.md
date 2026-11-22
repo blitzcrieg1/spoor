@@ -1,59 +1,102 @@
 # Spoor
 
-Spoor is an experimental Rust policy broker and audit bridge for agent tool
-calls. It evaluates a requested command against a local policy, records the
-decision and report as JSONL, and maps those records to Agentmetry audit events
-or TraceSig exports. The included detection rules cover selected agent
-behaviors in logs and network telemetry.
+**Follow an ARTEX tool call from policy decision to audit evidence.**
 
-## What it records
+An ARTEX worker asks to run a tool. Spoor can show what it requested, whether
+policy allowed it, and what the tool reported afterward. It's an experimental
+Rust broker and audit bridge for calls instrumented in a controlled lab.
 
-1. The broker answers `/decide` with `allow`, `deny`, or `ask` and a call ID.
-2. The shim requests a decision before running a permitted local tool and
-   submits its exit code to `/report`. On Linux it can attach a bounded parent
-   command with common credential patterns redacted.
-3. Spoor retains the decision's session and parent metadata on the corresponding
-   report. The watcher maps that metadata to
-   `tool.arguments.parent_command_line`.
+Microsoft and the FBI documented ARTEX use in real intrusions in November 2026.
+Spoor gives defenders a small, reproducible way to study the tool-call evidence
+an instrumented agent can leave. [Microsoft Threat Intelligence](https://www.microsoft.com/en-us/security/blog/2026/11/06/artex-abuse-expands-as-cybercriminals-target-financial-sector/) · [FBI advisory](https://www.ic3.gov/CSA/2026/261113.pdf)
 
-## Quick start
+[Try a synthetic trace](#try-a-synthetic-trace) ·
+[Explore the detections](#detection-rules) ·
+[See what has been verified](#verification)
 
-Install a current stable Rust toolchain with Cargo. From the repository root,
-build the workspace.
+## Where Spoor sees the call
 
-```sh
-cargo build --locked --manifest-path rust/Cargo.toml --workspace
+```mermaid
+flowchart TD
+    Request["ARTEX tool request"] --> Shim["Spoor shim"]
+    Shim -->|Request a decision| Policy{"Spoor policy broker"}
+    Policy -->|Allow| Run["Shim runs the tool"]
+    Policy -->|Deny or approval required| Stop["Shim stops"]
+    Policy -.->|Decision record| Trail[("JSONL audit trail")]
+    Run -.->|Exit report via broker| Trail
+    Trail --> Watch["Spoor watcher"]
+    Trail --> Trace["TraceSig export"]
+    Watch --> Audit["Agentmetry payload"]
 ```
 
-Run the watcher against the included synthetic trail in dry-run mode. This
-demonstrates the payload without credentials or a collector.
+The broker gives each decision a call ID. An allowed tool's report uses that ID,
+and Spoor carries the original session and parent command into the report. On
+Linux the shim samples the parent command and redacts common credential patterns.
 
-**PowerShell**
+## Try a synthetic trace
+
+Start here with a stable Rust toolchain and Cargo. The example reads two
+synthetic records and writes a local preview. It needs neither ARTEX nor an
+Agentmetry account.
+
+<details>
+<summary>PowerShell</summary>
 
 ```powershell
 $demo = Join-Path (Get-Location) ".spoor-demo"
 New-Item -ItemType Directory -Force -Path $demo | Out-Null
-Copy-Item examples/synthetic-events.jsonl (Join-Path $demo "broker-events.jsonl")
+Copy-Item -LiteralPath examples/synthetic-events.jsonl -Destination (Join-Path $demo "broker-events.jsonl")
 $env:BROKER_DATA_DIR = $demo
 $env:SPOOR_STATE_DIR = $demo
 $env:SPOOR_SOURCE = "broker"
 cargo run --locked --manifest-path rust/Cargo.toml --bin spoor -- watch --once --dry-run
-Get-Content (Join-Path $demo "ingest-preview.rust.jsonl")
+Get-Content (Join-Path $demo "ingest-preview.rust.jsonl") -Tail 2
 ```
 
-**Bash**
+</details>
+
+<details>
+<summary>Bash</summary>
 
 ```sh
 mkdir -p .spoor-demo
 cp examples/synthetic-events.jsonl .spoor-demo/broker-events.jsonl
 BROKER_DATA_DIR=.spoor-demo SPOOR_STATE_DIR=.spoor-demo SPOOR_SOURCE=broker \
   cargo run --locked --manifest-path rust/Cargo.toml --bin spoor -- watch --once --dry-run
-cat .spoor-demo/ingest-preview.rust.jsonl
+tail -n 2 .spoor-demo/ingest-preview.rust.jsonl
 ```
 
-The preview contains a `tool_called` event and a `tool_failed` event with the
-same session and `synthetic-parent --token=[REDACTED]` as the parent command.
-The watcher appends preview rows on each run.
+</details>
+
+### Read the two events together
+
+```mermaid
+sequenceDiagram
+    participant Trail as Synthetic broker trail
+    participant Watcher as Spoor watcher
+    participant Preview as Local audit preview
+    Trail->>Watcher: Policy allows echo
+    Watcher->>Preview: tool_called in demo-session
+    Trail->>Watcher: Tool reports exit code 1
+    Watcher->>Preview: tool_failed in demo-session
+    Note over Watcher,Preview: Both events keep the same redacted parent command
+```
+
+`tool_called` tells you the broker allowed the request. `tool_failed` tells you
+the command exited with an error. Both events have `demo-session` and carry
+`synthetic-parent --token=[REDACTED]` in `tool.arguments.parent_command_line`.
+
+## Detection rules
+
+- [Sigma](detections/sigma) covers brokered tool activity with ARTEX or shell
+  parent metadata, plus web log signals such as ARTEX user agents.
+- [Suricata](detections/suricata/artex-lab.rules) looks for ARTEX HTTP signals
+  where the relevant traffic is visible.
+- [TraceSig](detections/tracesig/lab_rules.yml) looks for sequences across the
+  audit trail, including scope drift and risky data movement.
+
+Use these experimental matches as leads to investigate alongside the rest of
+the event and your environment's baseline.
 
 ## Repository layout
 
@@ -73,9 +116,10 @@ cases. A separate loopback check used the real broker and watcher with a mock
 Agentmetry endpoint and verified session and parent metadata on both decision
 and failure events. Live Agentmetry storage of the new field is still unverified.
 
-Run the included Rust tests with:
+Build and test the Rust workspace.
 
 ```sh
+cargo build --locked --manifest-path rust/Cargo.toml --workspace
 cargo test --locked --manifest-path rust/Cargo.toml --workspace
 ```
 
@@ -91,7 +135,7 @@ The broker is designed for a trusted loopback boundary. Use operating system
 and network controls for isolation. The example policy permits unmatched
 commands, so review it for your environment. Parent command capture is optional
 and redaction is best effort. Treat audit trails as sensitive and restrict
-access to them. Detection matches are triage leads.
+access to them.
 
 ## License and attribution
 
