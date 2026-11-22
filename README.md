@@ -35,38 +35,13 @@ Linux the shim samples the parent command and redacts common credential patterns
 
 ## Try a synthetic trace
 
-Start here with a stable Rust toolchain and Cargo. The example reads two
-synthetic records and writes a local preview. It needs neither ARTEX nor an
-Agentmetry account.
-
-<details>
-<summary>PowerShell</summary>
-
-```powershell
-$demo = Join-Path (Get-Location) ".spoor-demo"
-New-Item -ItemType Directory -Force -Path $demo | Out-Null
-Copy-Item -LiteralPath examples/synthetic-events.jsonl -Destination (Join-Path $demo "broker-events.jsonl")
-$env:BROKER_DATA_DIR = $demo
-$env:SPOOR_STATE_DIR = $demo
-$env:SPOOR_SOURCE = "broker"
-cargo run --locked --manifest-path rust/Cargo.toml --bin spoor -- watch --once --dry-run
-Get-Content (Join-Path $demo "ingest-preview.rust.jsonl") -Tail 2
-```
-
-</details>
-
-<details>
-<summary>Bash</summary>
+Use a stable Rust toolchain with Cargo and Python 3.10 or newer. The same
+command works in PowerShell and Bash. The example reads two synthetic records
+and prints the local preview without contacting ARTEX or Agentmetry.
 
 ```sh
-mkdir -p .spoor-demo
-cp examples/synthetic-events.jsonl .spoor-demo/broker-events.jsonl
-BROKER_DATA_DIR=.spoor-demo SPOOR_STATE_DIR=.spoor-demo SPOOR_SOURCE=broker \
-  cargo run --locked --manifest-path rust/Cargo.toml --bin spoor -- watch --once --dry-run
-tail -n 2 .spoor-demo/ingest-preview.rust.jsonl
+python scripts/run_synthetic_trace.py
 ```
-
-</details>
 
 ### Read the two events together
 
@@ -111,10 +86,20 @@ the event and your environment's baseline.
 
 ## Verification
 
+[CI](https://github.com/blitzcrieg1/spoor/actions/workflows/ci.yml) builds the
+checkout, runs the Rust tests and this quick start, and checks the Sigma
+process fixtures on Linux and Windows.
+
 The source lab passed 42 Rust tests with one ignored benchmark and 77 replay
-cases. A separate loopback check used the real broker and watcher with a mock
-Agentmetry endpoint and verified session and parent metadata on both decision
-and failure events. Live Agentmetry storage of the new field is still unverified.
+cases. Those replay cases belong to the source lab. The quick start and Sigma
+fixtures above are included in this repository.
+
+An isolated Spoor broker and watcher also delivered a synthetic decision and
+failure to a running Agentmetry instance. Both events were read back with the
+same session and correlation ID and a redacted
+`tool.arguments.parent_command_line`. Agentmetry recorded the failure as
+`action.type=tool_called` with an error outcome and retained `tool_failed` in
+the source topic. The check used synthetic telemetry on loopback.
 
 Build and test the Rust workspace.
 
@@ -131,11 +116,13 @@ python scripts/evaluate_lab_sigma.py
 
 ## Deployment limits
 
-The broker is designed for a trusted loopback boundary. Use operating system
-and network controls for isolation. The example policy permits unmatched
-commands, so review it for your environment. Parent command capture is optional
-and redaction is best effort. Treat audit trails as sensitive and restrict
-access to them.
+The broker listens on loopback by default and assumes a trusted client. Use
+operating system and network controls for isolation. Review the example
+policy, which permits unmatched commands.
+
+Audit trails can contain command arguments and model prompt content. Parent
+command redaction covers common credential patterns. For audit data handling
+and private vulnerability reporting, see the [security policy](SECURITY.md).
 
 ## License and attribution
 
