@@ -46,9 +46,14 @@ enum Node {
 pub struct Regex {
     nodes: Vec<Node>,
     case_insensitive: bool,
+    #[cfg(test)]
+    pub(crate) step_budget: usize,
 }
 
 const BUDGET: usize = 500_000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MatchBudgetExhausted;
 
 impl Regex {
     pub fn new(pattern: &str, case_insensitive: bool) -> Result<Self, String> {
@@ -58,27 +63,31 @@ impl Regex {
         Ok(Regex {
             nodes,
             case_insensitive,
+            #[cfg(test)]
+            step_budget: BUDGET,
         })
     }
 
+    /// Conservative match for callers that only derive advisory labels.
     pub fn is_match(&self, text: &str) -> bool {
+        self.try_is_match(text).unwrap_or(true)
+    }
+
+    pub(crate) fn try_is_match(&self, text: &str) -> Result<bool, MatchBudgetExhausted> {
         let chars: Vec<char> = text.chars().collect();
+        #[cfg(not(test))]
         let mut budget = BUDGET;
+        #[cfg(test)]
+        let mut budget = self.step_budget;
         for start in 0..=chars.len() {
             if !self
-                .match_seq(&self.nodes, &chars, start, &mut budget)
+                .match_seq(&self.nodes, &chars, start, &mut budget)?
                 .is_empty()
             {
-                return true;
-            }
-            // Policy matching is security-sensitive. If a pathological input
-            // exhausts the shared budget, conservatively treat the pattern as
-            // matched so callers deny or escalate instead of failing open.
-            if budget == 0 {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     fn match_seq(
@@ -87,32 +96,32 @@ impl Regex {
         text: &[char],
         pos: usize,
         budget: &mut usize,
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>, MatchBudgetExhausted> {
         if nodes.is_empty() {
-            return vec![pos];
+            return Ok(vec![pos]);
         }
-        if *budget == 0 {
-            return Vec::new();
-        }
-        *budget -= 1;
-        let ends = self.match_node(&nodes[0], text, pos, budget);
+        spend_step(budget)?;
+        let ends = self.match_node(&nodes[0], text, pos, budget)?;
         let mut out = Vec::new();
         for end in ends {
-            for result in self.match_seq(&nodes[1..], text, end, budget) {
+            for result in self.match_seq(&nodes[1..], text, end, budget)? {
                 if !out.contains(&result) {
                     out.push(result);
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    fn match_node(&self, node: &Node, text: &[char], pos: usize, budget: &mut usize) -> Vec<usize> {
-        if *budget == 0 {
-            return Vec::new();
-        }
-        *budget -= 1;
-        match node {
+    fn match_node(
+        &self,
+        node: &Node,
+        text: &[char],
+        pos: usize,
+        budget: &mut usize,
+    ) -> Result<Vec<usize>, MatchBudgetExhausted> {
+        spend_step(budget)?;
+        Ok(match node {
             Node::Char(expected) => {
                 if pos < text.len() && self.eq_char(*expected, text[pos]) {
                     vec![pos + 1]
@@ -157,11 +166,11 @@ impl Regex {
                     Vec::new()
                 }
             }
-            Node::Group(inner) => self.match_seq(inner, text, pos, budget),
+            Node::Group(inner) => return self.match_seq(inner, text, pos, budget),
             Node::Alt(options) => {
                 let mut out = Vec::new();
                 for option in options {
-                    for end in self.match_seq(option, text, pos, budget) {
+                    for end in self.match_seq(option, text, pos, budget)? {
                         if !out.contains(&end) {
                             out.push(end);
                         }
@@ -170,7 +179,7 @@ impl Regex {
                 out
             }
             Node::Look { negative, node } => {
-                let inner = self.match_seq(node, text, pos, budget);
+                let inner = self.match_seq(node, text, pos, budget)?;
                 let matched = !inner.is_empty();
                 if matched != *negative {
                     vec![pos]
@@ -189,7 +198,7 @@ impl Regex {
                 while count < limit {
                     let mut next = Vec::new();
                     for from in &frontier {
-                        for end in self.match_node(inner, text, *from, budget) {
+                        for end in self.match_node(inner, text, *from, budget)? {
                             if !next.contains(&end) {
                                 next.push(end);
                             }
@@ -213,7 +222,7 @@ impl Regex {
                 }
                 result
             }
-        }
+        })
     }
 
     fn class_matches(&self, class: &Class, ch: char) -> bool {
@@ -510,12 +519,29 @@ impl Parser {
     }
 }
 
+fn spend_step(budget: &mut usize) -> Result<(), MatchBudgetExhausted> {
+    *budget = budget.checked_sub(1).ok_or(MatchBudgetExhausted)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn m(pattern: &str, text: &str) -> bool {
-        Regex::new(pattern, true).unwrap().is_match(text)
+        Regex::new(pattern, true)
+            .unwrap()
+            .try_is_match(text)
+            .unwrap()
+    }
+
+    #[test]
+    fn lookahead_propagates_incomplete_matches() {
+        let mut pattern = Regex::new(r"^(?!b)a", true).unwrap();
+        assert_eq!(pattern.try_is_match("a"), Ok(true));
+        assert_eq!(pattern.try_is_match("b"), Ok(false));
+        pattern.step_budget = 4;
+        assert_eq!(pattern.try_is_match("a"), Err(MatchBudgetExhausted));
     }
 
     #[test]
