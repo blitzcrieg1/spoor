@@ -1,6 +1,6 @@
 [package]
 name = "spoor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Spoor bridge binary: broker, trail watcher, TraceSig export, replay gate"
 
