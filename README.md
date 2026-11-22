@@ -162,10 +162,18 @@ The broker listens on loopback by default and assumes a trusted client. Use
 operating system and network controls for isolation. Review the example
 policy, which permits unmatched commands.
 
-Set `SPOOR_STRICT_AUDIT=1` on the broker to refuse otherwise allowed calls if
-the decision cannot be appended to the local trail. Audit write errors are
-logged in both modes. An unrecorded completion is rejected by the broker and
-reported by the shim.
+The broker attempts to write and sync each decision and completion record
+before responding. On Unix it also syncs the containing directory. Provision
+the broker's data directory on persistent storage before starting it when
+power-loss durability matters. Set `SPOOR_STRICT_AUDIT=1` to refuse otherwise
+allowed calls if the decision cannot be written or synced. Audit errors are
+logged in both modes. The broker rejects a completion it cannot persist and
+the shim reports the failure.
+
+If a policy regex runs out of matching steps, the broker denies the call with
+`rule_id=regex-budget-exhausted`. The response, local trail, and forwarded
+Agentmetry event carry that rule ID. In Agentmetry, query
+`tool.arguments.rule_id` to count these denials.
 
 The watcher holds its checkpoint when it can neither deliver an event nor
 flush it to the local retry queue. A running watcher retries from the blocked

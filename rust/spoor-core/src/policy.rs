@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::regex_lite::Regex;
+use crate::regex_lite::{MatchBudgetExhausted, Regex};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -8,6 +8,7 @@ pub type TaintState = HashMap<String, HashSet<String>>;
 /// Session cap: an unauthenticated client controls `session`, so keep the taint
 /// map bounded instead of letting it grow without limit.
 const MAX_TAINT_SESSIONS: usize = 10_000;
+const REGEX_BUDGET_RULE: &str = "regex-budget-exhausted";
 
 pub struct Engine {
     pub policy: Policy,
@@ -85,8 +86,10 @@ impl Engine {
         if !policy.enabled || decision.decision != "allow" {
             return decision;
         }
-        if !self.context.iter().any(|pattern| pattern.is_match(command)) {
-            return decision;
+        match try_match_patterns(&self.context, command) {
+            Ok(true) => {}
+            Ok(false) => return decision,
+            Err(_) => return regex_budget_denial("context-taint"),
         }
         let mode = policy.mode.to_lowercase();
         let next = if mode == "deny" { "deny" } else { "ask" };
@@ -105,12 +108,11 @@ impl Engine {
         let command = format!("{} {}", tool, argv.join(" "));
 
         // 1) DLP deny rules (regex search, case-insensitive)
-        for (index, rule) in self.policy.dlp_deny.iter().enumerate() {
-            if self.dlp[index]
-                .iter()
-                .any(|pattern| pattern.is_match(&command))
-            {
-                return Decision::new("deny", &rule.id, &rule.reason);
+        for (rule, patterns) in self.policy.dlp_deny.iter().zip(&self.dlp) {
+            match try_match_patterns(patterns, &command) {
+                Ok(true) => return Decision::new("deny", &rule.id, &rule.reason),
+                Ok(false) => continue,
+                Err(_) => return regex_budget_denial(&rule.id),
             }
         }
 
@@ -150,12 +152,11 @@ impl Engine {
         }
 
         // 3) Approval gate (regex over the full command, like Python)
-        for (index, rule) in self.policy.approval.iter().enumerate() {
-            if !self.approval[index]
-                .iter()
-                .any(|pattern| pattern.is_match(&command))
-            {
-                continue;
+        for (rule, patterns) in self.policy.approval.iter().zip(&self.approval) {
+            match try_match_patterns(patterns, &command) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => return regex_budget_denial(&rule.id),
             }
             let path = approvals.map(|dir| dir.join(format!("{}.ok", rule.id)));
             let approved = path
@@ -198,31 +199,33 @@ impl Engine {
         taint: &mut TaintState,
     ) -> (Decision, Option<TaintInfo>) {
         let policy = &self.policy.taint;
-        if !policy.enabled {
+        if !policy.enabled || decision.rule_id == REGEX_BUDGET_RULE {
             return (decision, None);
         }
         let mode = policy.mode.to_lowercase();
-        let source_rule = policy
-            .source_rules
-            .iter()
-            .enumerate()
-            .find(|(index, _)| {
-                self.sources[*index]
-                    .iter()
-                    .any(|pattern| pattern.is_match(command))
-            })
-            .map(|(_, rule)| rule);
-        let sink_rule = policy
-            .sink_rules
-            .iter()
-            .enumerate()
-            .find(|(index, _)| {
-                self.sinks[*index]
-                    .iter()
-                    .any(|pattern| pattern.is_match(command))
-            })
-            .map(|(_, rule)| rule);
-        let labels = self.derive_labels(command);
+        let mut source_rule = None;
+        let mut labels = HashSet::new();
+        for (rule, patterns) in policy.source_rules.iter().zip(&self.sources) {
+            match try_match_patterns(patterns, command) {
+                Ok(true) => {
+                    source_rule.get_or_insert(rule);
+                    labels.extend(rule.labels.iter().cloned());
+                }
+                Ok(false) => continue,
+                Err(_) => return (regex_budget_denial(&rule.id), None),
+            }
+        }
+        let mut sink_rule = None;
+        for (rule, patterns) in policy.sink_rules.iter().zip(&self.sinks) {
+            match try_match_patterns(patterns, command) {
+                Ok(true) => {
+                    sink_rule = Some(rule);
+                    break;
+                }
+                Ok(false) => continue,
+                Err(_) => return (regex_budget_denial(&rule.id), None),
+            }
+        }
 
         let prior: HashSet<String> = taint.get(session).cloned().unwrap_or_default();
         let mut newly: HashSet<String> = HashSet::new();
@@ -234,7 +237,7 @@ impl Engine {
                     "taint session capacity reached; refusing an untracked untrusted read",
                 );
             } else {
-                newly = labels.iter().cloned().collect();
+                newly = labels;
                 taint
                     .entry(session.to_string())
                     .or_default()
@@ -274,6 +277,23 @@ impl Engine {
         }
         (decision, Some(info))
     }
+}
+
+fn try_match_patterns(patterns: &[Regex], text: &str) -> Result<bool, MatchBudgetExhausted> {
+    for pattern in patterns {
+        if pattern.try_is_match(text)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn regex_budget_denial(rule_id: &str) -> Decision {
+    Decision::new(
+        "deny",
+        REGEX_BUDGET_RULE,
+        &format!("regex match budget exhausted while evaluating {}", rule_id),
+    )
 }
 
 fn compile(patterns: &[String]) -> Result<Vec<Regex>, String> {
@@ -450,6 +470,63 @@ mod tests {
             decision("SQLMAP", &["-u", "http://host.docker.internal:3000/x"]).decision,
             "ask"
         );
+    }
+
+    #[test]
+    fn incomplete_approval_match_denies_even_with_a_valid_token() {
+        let mut policy = engine().policy;
+        policy.dlp_deny.clear();
+        policy.approval.truncate(1);
+        let rule = &mut policy.approval[0];
+        rule.id = "demo-review".into();
+        rule.patterns = vec!["^demo ".into()];
+        let mut engine = Engine::from_policy(policy);
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("demo-review.ok"), "").unwrap();
+
+        let decision = engine.evaluate("demo", &[], Some(directory.path()));
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.approved, Some(true));
+
+        engine.approval[0][0].step_budget = 2;
+        let decision = engine.evaluate("demo", &[], Some(directory.path()));
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.rule_id, REGEX_BUDGET_RULE);
+        assert!(decision.reason.contains("demo-review"));
+        assert_eq!(decision.approved, None);
+    }
+
+    #[test]
+    fn incomplete_dlp_and_context_matches_have_a_distinct_denial() {
+        let mut engine = engine();
+        engine.dlp[0][0].step_budget = 0;
+        engine.context[0].step_budget = 0;
+        let dlp = engine.evaluate("demo", &[], None);
+        let context =
+            engine.context_escalate(Decision::new("allow", "default-allow", "in scope"), "demo");
+        for decision in [dlp, context] {
+            assert_eq!(decision.decision, "deny");
+            assert_eq!(decision.rule_id, REGEX_BUDGET_RULE);
+        }
+    }
+
+    #[test]
+    fn incomplete_taint_match_denies_without_changing_session_state() {
+        let mut policy = engine().policy;
+        policy.taint.source_rules[0].patterns = vec!["^demo$".into()];
+        let mut engine = Engine::from_policy(policy);
+        engine.sinks[0][0].step_budget = 0;
+        let mut state = TaintState::new();
+        let (decision, info) = engine.apply_taint(
+            "session",
+            "demo",
+            Decision::new("allow", "default-allow", "in scope"),
+            &mut state,
+        );
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.rule_id, REGEX_BUDGET_RULE);
+        assert!(info.is_none());
+        assert!(state.is_empty());
     }
 
     #[test]

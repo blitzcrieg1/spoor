@@ -27,6 +27,9 @@ fn broker_arguments(ev: &BrokerEvent, command: &str, phase: &str) -> Value {
     if let Some(call_id) = ev.call_id.as_deref().filter(|id| !id.is_empty()) {
         arguments["call_id"] = serde_json::json!(call_id);
     }
+    if let Some(rule_id) = &ev.rule_id {
+        arguments["rule_id"] = serde_json::json!(rule_id);
+    }
     if let Some(parent) = ev.parent_command_line.as_deref() {
         arguments["parent_command_line"] = serde_json::json!(parent);
     }

@@ -384,6 +384,32 @@ struct BrokerState {
     approvals: PathBuf,
     pending_reports: Arc<Mutex<HashMap<String, PendingCall>>>,
     strict_audit: bool,
+    #[cfg(test)]
+    audit_sync: SyncAudit,
+}
+
+impl BrokerState {
+    fn new(engine: Engine, events: PathBuf, approvals: PathBuf, strict_audit: bool) -> Self {
+        Self {
+            engine: Arc::new(engine),
+            taint: Arc::new(Mutex::new(HashMap::new())),
+            context: Arc::new(Mutex::new(HashMap::new())),
+            events,
+            approvals,
+            pending_reports: Arc::new(Mutex::new(HashMap::new())),
+            strict_audit,
+            #[cfg(test)]
+            audit_sync: sync_jsonl,
+        }
+    }
+
+    fn append_event(&self, event: &Value) -> bool {
+        #[cfg(test)]
+        let sync = self.audit_sync;
+        #[cfg(not(test))]
+        let sync = sync_jsonl;
+        append_jsonl_with_sync(&self.events, event, Some(sync))
+    }
 }
 
 #[derive(Clone)]
@@ -404,7 +430,7 @@ async fn broker_with_ready(args: &[String], ready: Option<tokio::sync::oneshot::
         .and_then(|value| value.parse().ok())
         .unwrap_or(8899);
     let policy_path = arg_value(args, "--policy").unwrap_or_else(|| "rust/policy.json".to_string());
-    let engine = Arc::new(Engine::load(&policy_path).expect("load policy"));
+    let engine = Engine::load(&policy_path).expect("load policy");
     let data = data_dir();
     let approvals = std::env::var_os("BROKER_APPROVALS")
         .map(PathBuf::from)
@@ -415,15 +441,12 @@ async fn broker_with_ready(args: &[String], ready: Option<tokio::sync::oneshot::
                 .join("..")
                 .join("approvals")
         });
-    let state = BrokerState {
+    let state = BrokerState::new(
         engine,
-        taint: Arc::new(Mutex::new(HashMap::new())),
-        context: Arc::new(Mutex::new(HashMap::new())),
-        events: data.join("broker-events.jsonl"),
+        data.join("broker-events.jsonl"),
         approvals,
-        pending_reports: Arc::new(Mutex::new(HashMap::new())),
-        strict_audit: std::env::var("SPOOR_STRICT_AUDIT").ok().as_deref() == Some("1"),
-    };
+        std::env::var("SPOOR_STRICT_AUDIT").ok().as_deref() == Some("1"),
+    );
     let app = Router::new()
         .route("/health", get(health))
         .route("/decide", post(decide))
@@ -645,14 +668,14 @@ async fn decide(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
     if !framework_match.is_empty() {
         event["framework_match"] = serde_json::to_value(&framework_match).unwrap_or(Value::Null);
     }
-    if !append_jsonl(&state.events, &event) {
+    if !state.append_event(&event) {
         if state.strict_audit && decision.decision == "allow" {
             state.pending_reports.lock().unwrap().remove(&call_id);
             return Json(json!({
                 "call_id": call_id,
                 "decision": "deny",
                 "rule_id": "audit-unavailable",
-                "reason": "strict audit requires a writable decision trail",
+                "reason": "strict audit requires a synced decision record",
                 "audit_recorded": false,
             }));
         }
@@ -698,7 +721,7 @@ async fn report(State(state): State<BrokerState>, Json(body): Json<Value>) -> Js
     if !framework_match.is_empty() {
         event["framework_match"] = serde_json::to_value(&framework_match).unwrap_or(Value::Null);
     }
-    if !append_jsonl(&state.events, &event) {
+    if !state.append_event(&event) {
         return Json(json!({"ok": false, "reason": "audit-unavailable"}));
     }
     pending.remove(call_id);
@@ -752,31 +775,38 @@ fn call_id() -> String {
 }
 
 fn append_jsonl(path: &Path, value: &Value) -> bool {
-    append_jsonl_with_sync(path, value, false)
+    append_jsonl_with_sync(path, value, None)
 }
 
 fn append_durable_jsonl(path: &Path, value: &Value) -> bool {
-    append_jsonl_with_sync(path, value, true)
+    append_jsonl_with_sync(path, value, Some(sync_jsonl))
 }
 
-fn append_jsonl_with_sync(path: &Path, value: &Value, sync: bool) -> bool {
+type SyncAudit = fn(&fs::File, &Path) -> std::io::Result<()>;
+
+fn sync_jsonl(file: &fs::File, _parent: &Path) -> std::io::Result<()> {
+    file.sync_all()?;
+    #[cfg(unix)]
+    fs::File::open(_parent)?.sync_all()?;
+    Ok(())
+}
+
+fn append_jsonl_with_sync(path: &Path, value: &Value, sync: Option<SyncAudit>) -> bool {
     static APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = APPEND_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let result = (|| -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .filter(|directory| !directory.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
         file.write_all(format!("{}\n", value).as_bytes())?;
-        if sync {
-            file.sync_all()?;
-            #[cfg(unix)]
-            if let Some(parent) = path.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
+        if let Some(sync) = sync {
+            sync(&file, parent)?;
         }
         Ok(())
     })();
@@ -1690,8 +1720,52 @@ fn decode_chunked(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_parent_command_line, decode_chunked, with_parent_command_line};
-    use serde_json::json;
+    use super::*;
+
+    fn test_broker(directory: &Path, strict_audit: bool) -> BrokerState {
+        let policy = serde_json::from_str(include_str!("../../policy.json")).unwrap();
+        BrokerState::new(
+            Engine::from_policy(policy),
+            directory.join("broker-events.jsonl"),
+            directory.join("approvals"),
+            strict_audit,
+        )
+    }
+
+    fn fail_after_append(file: &fs::File, _: &Path) -> std::io::Result<()> {
+        assert!(file.metadata()?.len() > 0);
+        Err(std::io::Error::other("simulated audit sync failure"))
+    }
+
+    #[tokio::test]
+    async fn strict_audit_refuses_allow_when_sync_fails_after_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_broker(directory.path(), true);
+        state.audit_sync = fail_after_append;
+        let Json(response) = decide(State(state.clone()), Json(json!({"tool": "demo"}))).await;
+        assert_eq!(response["decision"], "deny");
+        assert_eq!(response["rule_id"], "audit-unavailable");
+        assert_eq!(response["audit_recorded"], false);
+        assert!(state.pending_reports.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_stays_pending_when_sync_fails_after_append() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_broker(directory.path(), false);
+        let Json(decision) = decide(State(state.clone()), Json(json!({"tool": "demo"}))).await;
+        assert_eq!(decision["decision"], "allow");
+        let call_id = decision["call_id"].as_str().unwrap();
+        state.audit_sync = fail_after_append;
+        let Json(response) = report(
+            State(state.clone()),
+            Json(json!({"call_id": call_id, "tool": "demo", "exit_code": 0, "duration_ms": 1})),
+        )
+        .await;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["reason"], "audit-unavailable");
+        assert!(state.pending_reports.lock().unwrap().contains_key(call_id));
+    }
 
     #[test]
     fn decodes_chunked_bodies() {
