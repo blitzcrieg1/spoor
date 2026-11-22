@@ -212,20 +212,28 @@ cargo build --locked --manifest-path rust/Cargo.toml --workspace
 SPOOR_STRICT_AUDIT=1 rust/target/debug/spoor broker --policy rust/policy.json
 ```
 
-From a second terminal on the host, run a harmless command using the image
-you reviewed. The shim records the decision for the launch and the worker's
-exit status with the same call ID.
+From a second Bash terminal on the Linux host, approve the exact image,
+executable, and arguments, then send the approval to the launcher on standard
+input. The approval also binds the operator's Linux UID and the isolation
+flags. Use a private state directory on the host. The approval expires after
+five minutes and is consumed before the shim asks the broker to authorize
+the launch. If a launch fails after consumption, issue a fresh approval.
 
-```sh
+```bash
 docker pull python:3.12-alpine
 worker_image="$(docker image inspect --format '{{.Id}}' python:3.12-alpine)"
-python scripts/run_isolated_worker.py --shim rust/target/debug/spoor-shim \
-  "$worker_image" /usr/local/bin/python -c 'print("hello from the worker")'
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/spoor/worker-approvals"
+request=("$worker_image" /usr/local/bin/python -c 'print("hello from the worker")')
+approval="$(python scripts/run_isolated_worker.py approve --state-dir "$state_dir" "${request[@]}")"
+printf '%s\n' "$approval" | python scripts/run_isolated_worker.py run \
+  --state-dir "$state_dir" --shim rust/target/debug/spoor-shim "${request[@]}"
 ```
 
-The Linux CI probe checks the restrictions in a child process and confirms
-the broker records both events. Spoor audits the container launch and its
-exit. Activity inside the container stays subject to Docker's isolation.
+The launcher requires a broker that confirms strict audit. The shim records
+the launch and the worker's exit status with the same call ID. The Linux CI
+probe checks the restrictions in a child process, approval consumption, and
+both audit events. Activity inside the container stays subject to Docker's
+isolation.
 
 ## License and attribution
 
