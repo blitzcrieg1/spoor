@@ -1,6 +1,11 @@
-# Spoor
+# <img src="assets/spoor-mark.svg" width="48" height="48" align="middle" alt=""> Spoor
 
 **Follow an ARTEX tool call from policy decision to audit evidence.**
+
+[![Rust workspace](https://img.shields.io/badge/Rust-workspace-CE422B?logo=rust&logoColor=white)](rust/Cargo.toml)
+[![CI on Linux and Windows](https://github.com/blitzcrieg1/spoor/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/blitzcrieg1/spoor/actions/workflows/ci.yml)
+[![Apache License 2.0](https://img.shields.io/badge/License-Apache--2.0-2563EB)](LICENSE)
+[![Agentmetry ingest verified](https://img.shields.io/badge/Agentmetry-ingest_verified-087F73)](#verification)
 
 An ARTEX worker asks to run a tool. Spoor can show what it requested, whether
 policy allowed it, and what the tool reported afterward. It's an experimental

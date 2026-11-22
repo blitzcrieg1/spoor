@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Spoor trail mark</title>
+  <defs>
+    <linearGradient id="field" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172B40"/>
+      <stop offset="1" stop-color="#091320"/>
+    </linearGradient>
+    <linearGradient id="trail" x1="90" y1="35" x2="38" y2="96" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8DF5D6"/>
+      <stop offset="1" stop-color="#2BB6BD"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#field)" stroke="#334B60" stroke-width="2"/>
+  <path d="M90 34H53a16 16 0 0 0 0 32h22a16 16 0 0 1 0 32H38"
+        fill="none" stroke="url(#trail)" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="90" cy="34" r="7" fill="#FFD094" stroke="#16283C" stroke-width="3"/>
+  <path d="m64 58 8 8-8 8-8-8z" fill="#112235" stroke="#8DF5D6" stroke-width="3" stroke-linejoin="round"/>
+  <circle cx="38" cy="98" r="7" fill="#8DF5D6" stroke="#102031" stroke-width="3"/>
+</svg>
