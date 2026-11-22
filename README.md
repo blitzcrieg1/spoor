@@ -18,7 +18,8 @@ an instrumented agent can leave. [Microsoft Threat Intelligence](https://www.mic
 [Try a synthetic trace](#try-a-synthetic-trace) ·
 [Forward to Agentmetry](#forward-to-agentmetry) ·
 [Explore the detections](#detection-rules) ·
-[See what has been verified](#verification)
+[See what has been verified](#verification) ·
+[Contribute](CONTRIBUTING.md)
 
 ## Where Spoor sees the call
 
