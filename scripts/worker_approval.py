@@ -2,6 +2,7 @@
 
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ ISOLATION_PROFILE = (
     "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777", "--workdir=/tmp",
 )
 APPROVAL_TTL = 300
+APPROVAL_HISTORY_TTL = 3600
 
 
 @dataclass(frozen=True)
@@ -67,10 +69,18 @@ def approval_store(directory):
         os.close(fd)
     with closing(sqlite3.connect(path)) as database:
         database.execute("PRAGMA synchronous = FULL")
-        database.execute(
-            "CREATE TABLE IF NOT EXISTS approvals ("
-            "token_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL, expires_at REAL NOT NULL)"
-        )
+        database.executescript("""
+            CREATE TABLE IF NOT EXISTS approvals (
+                token_hash TEXT PRIMARY KEY, request_hash TEXT NOT NULL, expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS used_approvals (
+                token_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS approval_rejections (
+                id INTEGER PRIMARY KEY, timestamp_utc TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL, reason TEXT NOT NULL
+            );
+        """)
         with database:
             yield database
 
@@ -79,7 +89,9 @@ def issue_approval(directory, request):
     token = secrets.token_urlsafe(32)
     with approval_store(directory) as database:
         now = time.time()
-        database.execute("DELETE FROM approvals WHERE expires_at <= ?", (now,))
+        cutoff = now - APPROVAL_HISTORY_TTL
+        database.execute("DELETE FROM approvals WHERE expires_at <= ?", (cutoff,))
+        database.execute("DELETE FROM used_approvals WHERE expires_at <= ?", (cutoff,))
         database.execute(
             "INSERT INTO approvals VALUES (?, ?, ?)",
             (digest(token), request.fingerprint(), now + APPROVAL_TTL),
@@ -87,15 +99,57 @@ def issue_approval(directory, request):
     return token
 
 
-def consume_approval(directory, request, token):
+def _consume_token(database, token, request_hash, now):
+    if not token:
+        return "approval_missing"
     if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-        return False
+        return "approval_invalid"
+    token_hash = digest(token)
+    cutoff = now - APPROVAL_HISTORY_TTL
+    approval = database.execute(
+        "SELECT request_hash, expires_at FROM approvals WHERE token_hash = ? AND expires_at > ?",
+        (token_hash, cutoff),
+    ).fetchone()
+    if approval is None:
+        used = database.execute(
+            "SELECT 1 FROM used_approvals WHERE token_hash = ? AND expires_at > ?",
+            (token_hash, cutoff),
+        ).fetchone()
+        return "approval_reused" if used else "approval_unknown"
+    approved_request, expires_at = approval
+    if expires_at <= now:
+        return "approval_expired"
+    if approved_request != request_hash:
+        return "approval_request_mismatch"
+
+    database.execute("DELETE FROM approvals WHERE token_hash = ?", (token_hash,))
+    database.execute("INSERT INTO used_approvals VALUES (?, ?)", (token_hash, expires_at))
+    return None
+
+
+def consume_approval(directory, request, token):
+    request_hash = request.fingerprint()
     with approval_store(directory) as database:
         # Take the write lock before reading the clock, so expiry includes time
         # spent waiting for another launcher to commit.
         database.execute("BEGIN IMMEDIATE")
-        consumed = database.execute(
-            "DELETE FROM approvals WHERE token_hash = ? AND request_hash = ? AND expires_at > ?",
-            (digest(token), request.fingerprint(), time.time()),
-        ).rowcount
-    return consumed == 1
+        now = time.time()
+        reason = _consume_token(database, token, request_hash, now)
+        if reason is not None:
+            timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="milliseconds")
+            database.execute(
+                "INSERT INTO approval_rejections (timestamp_utc, request_fingerprint, reason) "
+                "VALUES (?, ?, ?)",
+                (timestamp, request_hash, reason),
+            )
+    return reason is None
+
+
+def read_rejections(directory):
+    with approval_store(directory) as database:
+        database.row_factory = sqlite3.Row
+        rows = database.execute(
+            "SELECT 'worker_approval_rejected' AS type, timestamp_utc, request_fingerprint, reason "
+            "FROM approval_rejections ORDER BY id"
+        )
+        yield from map(dict, rows)

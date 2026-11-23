@@ -238,6 +238,23 @@ both audit events. It forwards the successful launch and exit to Agentmetry
 v0.13.0 and reads them back by call ID. Activity inside the container stays
 subject to Docker's isolation.
 
+### Inspect rejected approvals
+
+The launcher records an approval rejection in the private approval database.
+That record contains its UTC timestamp, the request fingerprint, and a
+reason such as `approval_reused`, `approval_expired`, or
+`approval_request_mismatch`. The export is JSONL with four fields, including
+the event type.
+
+```sh
+python scripts/run_isolated_worker.py rejections --state-dir "$state_dir"
+```
+
+The rejection record omits tokens and raw arguments. Approval hashes can
+identify expired or previously consumed tokens for one hour after expiry.
+The launcher prunes older hashes when issuing a new approval. Rejected
+approvals stop before the shim submits a broker request.
+
 ### Measure launch latency
 
 On the Linux worker host, reuse the local Python image ID from the quickstart.
