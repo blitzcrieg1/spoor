@@ -161,6 +161,19 @@ def main():
             require(repeated.returncode == 1 and "used" in repeated.stderr
                     and not repeated.stdout, "Replaying an approval should be refused.")
 
+        rejected = subprocess.check_output(launcher + ["rejections", *options], text=True, timeout=10)
+        require(token.strip() not in rejected, "The rejection export exposed the approval token.")
+        records = [json.loads(line) for line in rejected.splitlines()]
+        require(
+            [record["reason"] for record in records] == ["approval_request_mismatch", "approval_reused"]
+            and all(
+                set(record) == {"type", "timestamp_utc", "request_fingerprint", "reason"}
+                and record["type"] == "worker_approval_rejected"
+                for record in records
+            ),
+            "The launcher must export exactly one minimal record per rejected approval.",
+        )
+
         trail = (directory / TRAIL).read_text(encoding="utf-8")
         require(token.strip() not in trail, "The trail exposed the approval token.")
         events = [json.loads(line) for line in trail.splitlines()]
@@ -195,7 +208,7 @@ def main():
             result.returncode == 126 and not result.stdout and "strict-audit-required" in result.stderr,
             f"The worker must require strict audit. {result.stderr}",
         )
-    print("Worker isolation, one-time approval, matched audit records, and strict audit refusal passed.")
+    print("Worker isolation, one-time approval, rejection records, and strict audit passed.")
 
 
 if __name__ == "__main__":

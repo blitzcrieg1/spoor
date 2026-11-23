@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import sys
 
-from worker_approval import WorkerRequest, consume_approval, issue_approval
+from worker_approval import WorkerRequest, consume_approval, issue_approval, read_rejections
 
 
 def run_worker(shim, request, state_dir, token):
@@ -62,14 +62,22 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     approve = commands.add_parser("approve", help="Create a five-minute, single-use approval")
     run = commands.add_parser("run", help="Read an approval from standard input and start the worker")
+    rejections = commands.add_parser("rejections", help="Print approval rejection records as JSONL")
     run.add_argument("--shim", required=True, type=Path, help="Path to the built spoor-shim binary")
-    for command in (approve, run):
+    for command in (approve, run, rejections):
         command.add_argument("--state-dir", required=True, type=Path, help="Private approval directory")
+    for command in (approve, run):
         command.add_argument("image", help="Full Docker image ID beginning with sha256:")
         command.add_argument("executable", help="Absolute path inside the image")
         command.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
+        if args.command == "rejections":
+            if sys.platform != "linux":
+                raise ValueError("Worker approval records are available on the Linux host.")
+            for record in read_rejections(args.state_dir):
+                print(json.dumps(record))
+            return 0
         request = WorkerRequest.from_cli(args.image, args.executable, args.arguments)
         if args.command == "approve":
             print(issue_approval(args.state_dir, request))
