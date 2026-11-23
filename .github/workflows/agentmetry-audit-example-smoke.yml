@@ -1,0 +1,53 @@
+name: Verify the Agentmetry audit example
+
+on:
+  push:
+    branches: [test/verify-agentmetry-audit-example]
+
+permissions:
+  contents: read
+
+jobs:
+  audit-example:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: b125a27b56be9a25a7bf4bd3fd72a31c85301c8a
+          persist-credentials: false
+      - name: Run the published commands against the file sink
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/spoor-audit-example"
+          example_python="$RUNNER_TEMP/spoor-audit-example/bin/python"
+          "$example_python" -m pip install agentmetry==0.13.0
+          "$example_python" - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tempfile
+
+          sys.path.insert(0, "scripts")
+          from check_isolated_worker import running_agentmetry
+
+          guide = Path("docs/agentmetry-audit-example.md").read_text()
+          forward, query = re.findall(r"^```bash\n(.*?)^```$", guide, re.M | re.S)
+          expected, = re.findall(r"^```text\n(.*?)^```$", guide, re.M | re.S)
+          with tempfile.TemporaryDirectory() as folder:
+              recorder = Path(folder) / "agentmetry"
+              with running_agentmetry(recorder) as (base, api_key):
+                  env = dict(os.environ, AGENTMETRY_URL=base, AGENTMETRY_API_KEY=api_key, TMPDIR=folder)
+                  subprocess.run(["bash", "-e", "-c", forward], env=env, check=True)
+              query = query.replace("/path/to/agentmetry/audit-forward.jsonl", '"$EXAMPLE_AUDIT"')
+              env = dict(os.environ, EXAMPLE_AUDIT=str(recorder / "audit-forward.jsonl"))
+              actual = subprocess.check_output(["bash", "-e", "-c", query], env=env, text=True)
+          print(actual, end="")
+          if actual != expected:
+              raise SystemExit("Actual Agentmetry export did not match the documented result.")
+          PY
