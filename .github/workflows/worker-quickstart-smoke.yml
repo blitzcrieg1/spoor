@@ -1,0 +1,95 @@
+name: Spoor v0.2.2 worker quickstart
+
+on:
+  push:
+    branches: [test/v0.2.2-linux-quickstart]
+
+permissions:
+  contents: read
+
+jobs:
+  worker-quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v0.2.2
+          persist-credentials: false
+      - name: Record host and release versions
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          . /etc/os-release
+          printf '%s\n' "$PRETTY_NAME"
+          docker version --format 'Docker {{.Server.Version}}'
+          rustc --version
+          python --version
+      - name: Follow the tagged README and verify the broker trail and replay
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          readme = Path("README.md").read_text()
+          pilot = readme.split("## Isolated Linux worker pilot", 1)[1]
+          pilot = pilot.split("### Measure launch latency", 1)[0]
+          broker, launch, export = re.findall(r"^```(?:sh|bash)\n(.*?)^```$", pilot, re.M | re.S)
+          build, start = broker.splitlines()
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          (temporary / "spoor-build.sh").write_text(build + "\n")
+          (temporary / "spoor-broker.sh").write_text("exec env " + start + "\n")
+          (temporary / "spoor-worker.sh").write_text(launch)
+          (temporary / "spoor-export.sh").write_text(export)
+          PY
+
+          bash -e "$RUNNER_TEMP/spoor-build.sh"
+          bash -e "$RUNNER_TEMP/spoor-broker.sh" >"$RUNNER_TEMP/spoor-broker.log" 2>&1 &
+          broker_pid=$!
+          trap 'kill "$broker_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..50}; do
+            if curl --silent --fail http://127.0.0.1:8899/health >/dev/null; then break; fi
+            sleep 0.2
+          done
+          curl --silent --show-error --fail http://127.0.0.1:8899/health
+          printf '\n'
+
+          export XDG_STATE_HOME="$RUNNER_TEMP/spoor-state"
+          started_at="$(date +%s.%N)"
+          source "$RUNNER_TEMP/spoor-worker.sh"
+          cp data/broker-events.jsonl "$RUNNER_TEMP/spoor-after-launch.jsonl"
+          if printf '%s\n' "$approval" | python scripts/run_isolated_worker.py run \
+            --state-dir "$state_dir" --shim rust/target/debug/spoor-shim "${request[@]}"; then
+            echo "Expected a replay rejection"
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          replayed_at="$(date +%s.%N)"
+          cmp "$RUNNER_TEMP/spoor-after-launch.jsonl" data/broker-events.jsonl
+          source "$RUNNER_TEMP/spoor-export.sh" >"$RUNNER_TEMP/spoor-rejections.jsonl"
+          docker events --since "$started_at" --until "$replayed_at" --filter type=container \
+            --filter event=create --filter event=start --format '{{.Action}}' >"$RUNNER_TEMP/spoor-docker-events"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          decision, completion = map(json.loads, Path("data/broker-events.jsonl").read_text().splitlines())
+          assert decision["type"] == "decide" and decision["decision"] == "allow"
+          assert completion["type"] == "report" and completion["exit_code"] == 0
+          assert decision["call_id"] and decision["call_id"] == completion["call_id"]
+          rejection, = map(json.loads, (temporary / "spoor-rejections.jsonl").read_text().splitlines())
+          assert set(rejection) == {"type", "timestamp_utc", "request_fingerprint", "reason"}
+          assert rejection["type"] == "worker_approval_rejected"
+          assert rejection["reason"] == "approval_reused"
+          assert (temporary / "spoor-docker-events").read_text().splitlines() == ["create", "start"]
+          print("Matched launch decision and completion, one approval_reused record, and zero containers started on replay.")
+          PY
