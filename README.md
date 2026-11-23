@@ -110,6 +110,8 @@ event. Look for the full model-turn record in Spoor's local trail.
 - [Sigma](detections/sigma) covers brokered completion reports with ARTEX or
   shell parent metadata, plus web log signals such as ARTEX user agents. The
   process rule uses the phase field preserved in stored Agentmetry events.
+  The [Loki backend check](detections/sigma/tests/README.md) tests all six
+  fixtures against the converted query.
 - [Suricata](detections/suricata/artex-lab.rules) looks for ARTEX HTTP signals
   where the relevant traffic is visible.
 - [TraceSig](detections/tracesig/lab_rules.yml) looks for sequences across the
