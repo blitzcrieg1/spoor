@@ -1,4 +1,4 @@
-name: Spoor v0.2.2 worker quickstart
+name: Spoor Linux worker quickstart
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: v0.2.2
+          ref: 36b78a3d7345a971a7b6119f01b6b3322b0acd3a
           persist-credentials: false
       - name: Record host and release versions
         shell: bash
@@ -27,7 +27,7 @@ jobs:
           printf '%s\n' "$PRETTY_NAME"
           docker version --format 'Docker {{.Server.Version}}'
           rustc --version
-          python --version
+          python3 --version
       - name: Follow the tagged README and verify the broker trail and replay
         shell: bash
         run: |
@@ -63,7 +63,7 @@ jobs:
           started_at="$(date +%s.%N)"
           source "$RUNNER_TEMP/spoor-worker.sh"
           cp data/broker-events.jsonl "$RUNNER_TEMP/spoor-after-launch.jsonl"
-          if printf '%s\n' "$approval" | python scripts/run_isolated_worker.py run \
+          if printf '%s\n' "$approval" | python3 scripts/run_isolated_worker.py run \
             --state-dir "$state_dir" --shim rust/target/debug/spoor-shim "${request[@]}"; then
             echo "Expected a replay rejection"
             exit 1
