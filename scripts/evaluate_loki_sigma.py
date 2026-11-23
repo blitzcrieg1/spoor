@@ -73,12 +73,7 @@ def query_ids(base, query, start, end, limit):
     }
 
 
-def check(base):
-    fixtures = [
-        json.loads(line)
-        for line in FIXTURE_PATH.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+def check(base, fixtures):
     ids = set(range(len(fixtures)))
     if not ids:
         raise SystemExit("No Sigma fixtures were loaded.")
@@ -123,12 +118,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--loki-url", default="http://127.0.0.1:3100", help="Disposable Loki endpoint")
     parser.add_argument("--print-query", action="store_true", help='Print LogQL for the job="spoor" stream')
+    parser.add_argument("--agentmetry", action="store_true", help="Use events exported by Agentmetry v0.13.0")
     args = parser.parse_args()
     if args.print_query:
         print(convert('{job="spoor"}'))
         return
+    if args.agentmetry:
+        from agentmetry_sigma_fixtures import export_fixtures
+
+        fixtures = export_fixtures()
+    else:
+        fixtures = [
+            json.loads(line)
+            for line in FIXTURE_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
     try:
-        check(args.loki_url.rstrip("/"))
+        check(args.loki_url.rstrip("/"), fixtures)
     except HTTPError as error:
         detail = error.read(1000).decode("utf-8", errors="replace").strip()
         raise SystemExit(f"Loki HTTP {error.code}: {detail}") from error
