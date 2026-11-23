@@ -101,6 +101,9 @@ Spoor events and the claimed app as context. For execution counts, filter on
 allowed call to `action.type=tool_called`. The `source_topic` field keeps the
 original event name.
 
+The [worked audit example](docs/agentmetry-audit-example.md) shows how to pair
+two calls in one session and count reported executions from the file export.
+
 The broker event pair is the verified integration. The optional model proxy
 produces an `llm_turn` payload that Agentmetry v0.13.0 handles as a generic tool
 event. Look for the full model-turn record in Spoor's local trail.
