@@ -27,7 +27,7 @@ docker run --rm -p 127.0.0.1:3100:3100 grafana/loki:3.7.10 \
 ```
 
 In another terminal, run these commands from the Spoor repository root.
-Use a Python environment dedicated to this check.
+Use Python 3.11 or newer in an environment dedicated to this check.
 
 ```sh
 python -m pip install pySigma==2.1.1 pySigma-backend-loki==0.16.0
