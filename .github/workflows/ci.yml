@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      worker_latency:
+        description: Measure strict-audit Linux worker launch latency
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,3 +66,9 @@ jobs:
             docker logs --tail 30 "$container"
             exit 1
           fi
+      - name: Measure strict-audit worker latency
+        if: runner.os == 'Linux' && inputs.worker_latency
+        shell: bash
+        run: |
+          worker_image="$(docker image inspect --format '{{.Id}}' python:3.12-alpine)"
+          python scripts/benchmark_isolated_worker.py "$worker_image" | tee -a "$GITHUB_STEP_SUMMARY"

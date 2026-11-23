@@ -238,6 +238,21 @@ both audit events. It forwards the successful launch and exit to Agentmetry
 v0.13.0 and reads them back by call ID. Activity inside the container stays
 subject to Docker's isolation.
 
+### Measure launch latency
+
+On the Linux worker host, reuse the local Python image ID from the quickstart.
+
+```sh
+python scripts/benchmark_isolated_worker.py "$worker_image"
+```
+
+The benchmark starts its own strict-audit broker and runs three warmups
+followed by 25 sequential launches. It reports the Linux host, Docker and
+Rust versions, and median and 95th-percentile times. The timer includes
+the launcher, local approval consumption, container start and exit, and
+both synced audit records. Image pulls and approval issuance happen
+outside the timed window.
+
 ## License and attribution
 
 Spoor's original code is licensed under the [Apache License 2.0](LICENSE).
