@@ -207,7 +207,12 @@ capabilities, disallows privilege gains, and requires Docker seccomp and
 resource limits. It accepts a locally available image by its full ID,
 rejects images that declare volumes, and supplies no host bind mounts.
 
-Build the workspace and start the host broker in strict audit mode.
+Use a stable Rust toolchain with Cargo, Python 3.10 or newer, and a running
+Linux Docker daemon that your operator account can access. On Debian or
+Ubuntu, install the build dependencies listed in [Contributing](CONTRIBUTING.md).
+Run the commands from the repository root in both terminals.
+
+Build the workspace and leave the host broker running in the first terminal.
 
 ```sh
 cargo build --locked --manifest-path rust/Cargo.toml --workspace
@@ -226,17 +231,20 @@ docker pull python:3.12-alpine
 worker_image="$(docker image inspect --format '{{.Id}}' python:3.12-alpine)"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/spoor/worker-approvals"
 request=("$worker_image" /usr/local/bin/python -c 'print("hello from the worker")')
-approval="$(python scripts/run_isolated_worker.py approve --state-dir "$state_dir" "${request[@]}")"
-printf '%s\n' "$approval" | python scripts/run_isolated_worker.py run \
+approval="$(python3 scripts/run_isolated_worker.py approve --state-dir "$state_dir" "${request[@]}")"
+printf '%s\n' "$approval" | python3 scripts/run_isolated_worker.py run \
   --state-dir "$state_dir" --shim rust/target/debug/spoor-shim "${request[@]}"
 ```
 
-The launcher requires a broker that confirms strict audit. The shim records
-the launch and the worker's exit status with the same call ID. The Linux CI
-probe checks the restrictions in a child process, approval consumption, and
-both audit events. It forwards the successful launch and exit to Agentmetry
-v0.13.0 and reads them back by call ID. Activity inside the container stays
-subject to Docker's isolation.
+The worker prints `hello from the worker`. Open `data/broker-events.jsonl`, the
+default broker trail, and find the matching `call_id` on the two records.
+The `decide` record has `decision: allow` and the `report` record has
+`exit_code: 0`. The launcher requires a broker that confirms strict audit.
+
+The Linux CI probe checks the restrictions in a child process, approval
+consumption, and both audit events. It forwards the successful launch and exit
+to Agentmetry v0.13.0 and reads them back by call ID. Activity inside the
+container stays subject to Docker's isolation.
 
 ### Inspect rejected approvals
 
@@ -247,7 +255,7 @@ reason such as `approval_reused`, `approval_expired`, or
 the event type.
 
 ```sh
-python scripts/run_isolated_worker.py rejections --state-dir "$state_dir"
+python3 scripts/run_isolated_worker.py rejections --state-dir "$state_dir"
 ```
 
 The rejection record omits tokens and raw arguments. Approval hashes can
@@ -255,12 +263,18 @@ identify expired or previously consumed tokens for one hour after expiry.
 The launcher prunes older hashes when issuing a new approval. Rejected
 approvals stop before the shim submits a broker request.
 
+To check replay handling, repeat the `printf … | python3 … run` command in the
+same terminal with the same approval. The launcher exits with status 1,
+starts zero containers, and adds one `approval_reused` record. The broker
+trail keeps the original decision and completion pair. When you finish, stop
+the broker with Ctrl+C in the first terminal.
+
 ### Measure launch latency
 
 On the Linux worker host, reuse the local Python image ID from the quickstart.
 
 ```sh
-python scripts/benchmark_isolated_worker.py "$worker_image"
+python3 scripts/benchmark_isolated_worker.py "$worker_image"
 ```
 
 The benchmark starts its own strict-audit broker and runs three warmups
